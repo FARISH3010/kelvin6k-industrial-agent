@@ -1,14 +1,13 @@
-/** Dashboard header: robot / machine / camera / communication status. */
+/** Application header: operational branding, server health, and status chips. */
 
 import "./Header.css";
-import type { HealthResponse, StatusResponse } from "../types";
+import type { HealthResponse } from "../types";
 
 interface Props {
-  status: StatusResponse | null;
   health: HealthResponse | null;
   connected: boolean;
-  focusedMode?: boolean;
-  onToggleFocusedMode?: () => void;
+  activeView?: "assistant" | "report";
+  onToggleView?: (view: "assistant" | "report") => void;
 }
 
 function StatusTile({
@@ -33,12 +32,7 @@ function StatusTile({
   );
 }
 
-export function Header({ status, health, connected, focusedMode = false, onToggleFocusedMode }: Props) {
-  const robotOnline = status?.robot.robot_online.value === true;
-  const cameraLive = status?.camera.status === "live";
-  const machineState = status?.material.machine_state.value ?? null;
-  const machineLink = status?.robot.communication.machine_link;
-
+export function Header({ health, connected, activeView = "assistant", onToggleView }: Props) {
   return (
     <header className="app-header">
       <div className="brand">
@@ -48,48 +42,36 @@ export function Header({ status, health, connected, focusedMode = false, onToggl
         </div>
         <div>
           <h1>KELVIN6K ROBOT AI</h1>
-          <span className="brand-sub">
-            {focusedMode
-              ? "Operational Intelligence & Attendance System"
-              : "Industrial Print Monitoring & Voice Assistant"}
-          </span>
+          <span className="brand-sub">Operational Intelligence &amp; Attendance System</span>
         </div>
       </div>
+
+      {onToggleView && (
+        <div className="header-view-toggle">
+          <button
+            type="button"
+            className={`header-view-btn ${activeView === "assistant" ? "header-view-btn-active" : ""}`}
+            onClick={() => onToggleView("assistant")}
+          >
+            🎙️ Assistant Floor
+          </button>
+          <button
+            type="button"
+            className={`header-view-btn ${activeView === "report" ? "header-view-btn-active" : ""}`}
+            onClick={() => onToggleView("report")}
+          >
+            📊 Attendance Report
+          </button>
+        </div>
+      )}
 
       <div className="status-tiles">
         <StatusTile
           label="Backend API"
           value={connected ? "CONNECTED" : "OFFLINE"}
           tone={connected ? "ok" : "bad"}
-          detail={connected ? (machineLink?.reason || "FastAPI server running and responsive") : "Cannot reach backend server"}
+          detail={connected ? "FastAPI server running and responsive" : "Cannot reach backend server"}
         />
-
-        {!focusedMode && (
-          <>
-            <StatusTile
-              label="Robot"
-              value={robotOnline ? "ONLINE" : "OFFLINE"}
-              tone={robotOnline ? "ok" : "bad"}
-              detail={status?.robot.robot_status.reason}
-            />
-            <StatusTile
-              label="Machine"
-              value={machineState ? String(machineState).toUpperCase() : "UNAVAILABLE"}
-              tone={machineState ? "warn" : "muted"}
-              detail={
-                status?.material.machine_state.provenance === "MOCK"
-                  ? "Simulated value — not the real machine."
-                  : status?.material.machine_state.reason
-              }
-            />
-            <StatusTile
-              label="Camera"
-              value={(status?.camera.status ?? "unknown").toUpperCase()}
-              tone={status?.camera.status === "disabled" ? "muted" : (cameraLive ? "ok" : "bad")}
-              detail={status?.camera.error ?? undefined}
-            />
-          </>
-        )}
       </div>
 
       <div className="header-chips">
@@ -107,16 +89,6 @@ export function Header({ status, health, connected, focusedMode = false, onToggl
           </>
         ) : null}
         <span className="header-chip header-chip-readonly">READ-ONLY</span>
-        {onToggleFocusedMode && (
-          <button
-            type="button"
-            onClick={onToggleFocusedMode}
-            className="focused-mode-toggle-btn"
-            title={focusedMode ? "Switch to Full Multi-panel Dashboard" : "Switch to Focused Chat & Attendance View"}
-          >
-            {focusedMode ? "🖥️ Full Dashboard" : "🎯 Focused Mode"}
-          </button>
-        )}
       </div>
     </header>
   );

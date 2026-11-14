@@ -21,6 +21,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -845,11 +846,17 @@ def tts_diagnostics() -> Dict[str, Any]:
 # --- Phase 2C: Shift & Production Data API -----------------------------
 
 class CreateOperatorRequest(BaseModel):
-    operator_id: str
+    operator_id: Optional[str] = None
     name: str
     employee_code: Optional[str] = None
+    Employee_id: Optional[str] = None
     role: str = "operator"
     active: int = 1
+
+
+class UpdateEmployeeIdRequest(BaseModel):
+    operator_name_or_id: str
+    new_employee_id: str
 
 
 class StartShiftRequest(BaseModel):
@@ -915,19 +922,52 @@ def get_operators(active_only: bool = True) -> Dict[str, Any]:
 @app.post("/api/operators")
 def create_operator(req: CreateOperatorRequest) -> Dict[str, Any]:
     """Creates a new operator."""
+    eid = req.Employee_id.strip() if req.Employee_id and req.Employee_id.strip() else None
+    code = req.employee_code.strip() if req.employee_code and req.employee_code.strip() else None
+
+    # Format validations
+    if eid and not re.fullmatch(r"K6K\d+", eid.upper()):
+        raise HTTPException(status_code=400, detail="Employee ID must be in the format of K6K followed by numbers (e.g. K6K001).")
+    if code and not re.fullmatch(r"\d+", code):
+        raise HTTPException(status_code=400, detail="Employee code must contain only numbers.")
+
     try:
-        op_id = shift_store.create_operator(
-            operator_id=req.operator_id,
+        res = shift_store.create_or_update_employee(
             name=req.name,
-            employee_code=req.employee_code,
             role=req.role,
-            active=req.active,
+            status="Active" if req.active else "Inactive",
+            Employee_id=eid.upper() if eid else None,
+            employee_code=code,
         )
-        return {"success": True, "operator_id": op_id}
+        if not res.get("success"):
+            raise HTTPException(status_code=400, detail=res.get("error", "Failed to create employee."))
+        op_rec = res.get("operator") or {}
+        return {"success": True, "operator_id": op_rec.get("operator_id"), "operator": op_rec}
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail=f"Operator already exists or employee code conflict: {exc}")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/operators/update-id")
+def update_operator_id(req: UpdateEmployeeIdRequest) -> Dict[str, Any]:
+    """Updates an employee's Employee_id to a new ID, and clears their employee_code."""
+    eid = req.new_employee_id.strip()
+    if not re.fullmatch(r"K6K\d+", eid.upper()):
+        raise HTTPException(status_code=400, detail="Employee ID must be in the format of K6K followed by numbers (e.g. K6K001).")
+    res = shift_store.update_employee_id(req.operator_name_or_id, eid.upper())
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Failed to update Employee ID."))
+    return res
+
+
+@app.delete("/api/operators/{operator_id}")
+def delete_operator(operator_id: str) -> Dict[str, Any]:
+    """Deletes an operator and cascades deletion across shift records."""
+    success = shift_store.delete_operator(operator_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Operator '{operator_id}' not found.")
+    return {"success": True, "message": f"Operator '{operator_id}' deleted successfully."}
 
 
 @app.get("/api/shifts/active")
@@ -1014,6 +1054,238 @@ def list_shifts(
         limit=limit,
     )
     return {"shifts": shifts, "count": len(shifts)}
+
+
+@app.get("/api/reports/attendance")
+def get_attendance_report(
+    date: Optional[str] = None,
+    operator_id: Optional[str] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """
+    Fetches comprehensive attendance report joined from database shifts & operators.
+    When a date is set, EVERY employee in the system is listed with their Present/Absent status:
+      - 'Present' if the employee started or completed a shift on that date.
+      - 'Absent' if the employee has no shift on that date.
+    When no date is set, returns historical shift records marked Present.
+    """
+    now_ts = time.time()
+
+    def _fmt_clock_time(val: Any, fallback_ts: Optional[float] = None) -> str:
+        if val:
+            val_s = str(val).strip()
+            if " " in val_s:
+                val_s = val_s.split(" ")[1]
+            try:
+                parts = val_s.split(":")
+                h, m = int(parts[0]), int(parts[1])
+                s = int(parts[2]) if len(parts) > 2 else 0
+                return datetime.time(h, m, s).strftime("%I:%M %p")
+            except Exception:
+                return val_s
+        if fallback_ts:
+            try:
+                return datetime.datetime.fromtimestamp(fallback_ts).strftime("%I:%M %p")
+            except Exception:
+                pass
+        return "-"
+
+    with db.connect() as conn:
+        all_ops = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT operator_id, name, Employee_id, employee_code FROM operators ORDER BY operator_id ASC"
+            ).fetchall()
+        ]
+
+        if date:
+            target_date = date.strip()
+            # Query all shifts on this date
+            shift_rows = [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT s.*, COALESCE(o.name, s.operator_name) AS resolved_name
+                    FROM shifts s
+                    LEFT JOIN operators o ON CAST(s.operator_id AS TEXT) = CAST(o.operator_id AS TEXT)
+                                           OR s.operator_id = o.Employee_id
+                                           OR s.operator_id = o.employee_code
+                    WHERE s.shift_date = ?
+                    ORDER BY s.shift_id DESC
+                    """,
+                    (target_date,),
+                ).fetchall()
+            ]
+
+            # Index shifts by operator
+            shifts_by_op: Dict[str, List[Dict[str, Any]]] = {}
+            for s in shift_rows:
+                op_key = str(s["operator_id"])
+                shifts_by_op.setdefault(op_key, []).append(s)
+                if s.get("employee_code"):
+                    shifts_by_op.setdefault(str(s["employee_code"]), []).append(s)
+
+            records = []
+            for o in all_ops:
+                op_id_str = str(o["operator_id"])
+                op_eid = str(o["Employee_id"]) if o.get("Employee_id") else None
+                op_code = str(o["employee_code"]) if o.get("employee_code") else None
+
+                matched_shifts = (
+                    shifts_by_op.get(op_id_str)
+                    or (shifts_by_op.get(op_eid) if op_eid else None)
+                    or (shifts_by_op.get(op_code) if op_code else None)
+                    or []
+                )
+
+                if matched_shifts:
+                    for s in matched_shifts:
+                        st_epoch = s.get("start_time")
+                        et_epoch = s.get("end_time")
+                        is_active = (s.get("status") or "").lower() in ("open", "active") or et_epoch is None
+                        total_hrs = s.get("total_hours")
+                        if total_hrs is None:
+                            if st_epoch:
+                                total_hrs = round(max(0.0, (et_epoch or now_ts) - st_epoch) / 3600.0, 2)
+                            else:
+                                total_hrs = 0.0
+                        ot_hrs = s.get("overtime_hours")
+                        if ot_hrs is None:
+                            ot_hrs = max(0.0, round(float(total_hrs) - 9.0, 2)) if total_hrs else 0.0
+
+                        records.append({
+                            "shift_id": s["shift_id"],
+                            "operator_id": o["operator_id"],
+                            "id": o.get("Employee_id") or "-",
+                            "code": o.get("employee_code") or "-",
+                            "name": o["name"],
+                            "start_time": _fmt_clock_time(s.get("actual_start_time"), st_epoch),
+                            "end_time": "-" if is_active else _fmt_clock_time(s.get("actual_end_time"), et_epoch),
+                            "overtime": f"{float(ot_hrs):.2f} hrs" if float(ot_hrs) > 0 else "0.00 hrs",
+                            "overtime_num": float(ot_hrs),
+                            "date": target_date,
+                            "total_hours": f"{float(total_hrs):.2f} hrs",
+                            "total_hours_num": float(total_hrs),
+                            "presence": "Present",
+                            "status": "ACTIVE" if is_active else "COMPLETED",
+                            "attendance_status": s.get("attendance_status") or ("On Time" if not is_active else "Active"),
+                        })
+                else:
+                    # Employee has no shift on this date -> Absent
+                    records.append({
+                        "shift_id": f"absent_{o['operator_id']}_{target_date}",
+                        "operator_id": o["operator_id"],
+                        "id": o.get("Employee_id") or "-",
+                        "code": o.get("employee_code") or "-",
+                        "name": o["name"],
+                        "start_time": "-",
+                        "end_time": "-",
+                        "overtime": "0.00 hrs",
+                        "overtime_num": 0.0,
+                        "date": target_date,
+                        "total_hours": "0.00 hrs",
+                        "total_hours_num": 0.0,
+                        "presence": "Absent",
+                        "status": "ABSENT",
+                        "attendance_status": "Absent",
+                    })
+
+            # Optional filter by operator_id if requested
+            if operator_id:
+                clean_target = str(operator_id).strip().lower()
+                records = [
+                    r for r in records
+                    if clean_target in (
+                        str(r["operator_id"]).lower(),
+                        str(r["id"]).lower(),
+                        str(r["code"]).lower(),
+                        r["name"].lower(),
+                    )
+                ]
+
+            return {
+                "report": records,
+                "count": len(records),
+                "total_work_hours": round(sum(r["total_hours_num"] for r in records), 2),
+                "total_overtime_hours": round(sum(r["overtime_num"] for r in records), 2),
+            }
+
+        # No date filter set: return full history of shifts with presence = 'Present'
+        query = """
+            SELECT 
+                s.shift_id,
+                s.operator_id,
+                COALESCE(o.Employee_id, s.operator_id) AS Employee_id,
+                o.employee_code,
+                COALESCE(o.name, s.operator_name, 'Operator ' || s.operator_id) AS name,
+                s.actual_start_time,
+                s.actual_end_time,
+                s.start_time,
+                s.end_time,
+                s.shift_date,
+                s.total_hours,
+                s.overtime_hours,
+                s.status,
+                s.attendance_status
+            FROM shifts s
+            LEFT JOIN operators o ON CAST(s.operator_id AS TEXT) = CAST(o.operator_id AS TEXT)
+                                   OR s.operator_id = o.Employee_id
+                                   OR s.operator_id = o.employee_code
+        """
+        clauses, params = [], []
+        if operator_id:
+            clauses.append("(s.operator_id = ? OR o.Employee_id = ? OR o.employee_code = ?)")
+            params.extend([str(operator_id).strip()] * 3)
+
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY s.shift_id DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
+
+    records = []
+    for r in rows:
+        d = dict(r)
+        st_epoch = d.get("start_time")
+        et_epoch = d.get("end_time")
+        is_active = (d.get("status") or "").lower() in ("open", "active") or et_epoch is None
+
+        total_hrs = d.get("total_hours")
+        if total_hrs is None:
+            if st_epoch:
+                total_hrs = round(max(0.0, (et_epoch or now_ts) - st_epoch) / 3600.0, 2)
+            else:
+                total_hrs = 0.0
+
+        ot_hrs = d.get("overtime_hours")
+        if ot_hrs is None:
+            ot_hrs = max(0.0, round(float(total_hrs) - 9.0, 2)) if total_hrs else 0.0
+
+        records.append({
+            "shift_id": d["shift_id"],
+            "operator_id": d["operator_id"],
+            "id": d["Employee_id"] or "-",
+            "code": d["employee_code"] or "-",
+            "name": d["name"],
+            "start_time": _fmt_clock_time(d.get("actual_start_time"), st_epoch),
+            "end_time": "-" if is_active else _fmt_clock_time(d.get("actual_end_time"), et_epoch),
+            "overtime": f"{float(ot_hrs):.2f} hrs" if float(ot_hrs) > 0 else "0.00 hrs",
+            "overtime_num": float(ot_hrs),
+            "date": d["shift_date"] or "-",
+            "total_hours": f"{float(total_hrs):.2f} hrs",
+            "total_hours_num": float(total_hrs),
+            "presence": "Present",
+            "status": "ACTIVE" if is_active else "COMPLETED",
+            "attendance_status": d.get("attendance_status") or ("On Time" if not is_active else "Active"),
+        })
+
+    return {
+        "report": records,
+        "count": len(records),
+        "total_work_hours": round(sum(r["total_hours_num"] for r in records), 2),
+        "total_overtime_hours": round(sum(r["overtime_num"] for r in records), 2),
+    }
 
 
 @app.post("/api/production")

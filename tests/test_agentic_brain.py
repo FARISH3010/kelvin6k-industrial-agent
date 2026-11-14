@@ -426,7 +426,8 @@ class TestAgenticBrainAndOvertime(unittest.TestCase):
         self.assertIn("get_operators_status", tool_names)
         self.assertNotIn("get_site_people_count", tool_names)
         self.assertNotIn("get_site_detections", tool_names)
-        self.assertEqual(len(TOOLS), 24)
+        self.assertIn("update_employee_id", tool_names)
+        self.assertEqual(len(TOOLS), 25)
 
         bot = Assistant(use_llm=False)
         self.assertFalse(bot.use_llm)

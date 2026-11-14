@@ -5,6 +5,8 @@ import {
   getAttendanceList,
   getOperators,
   createOperator,
+  deleteOperator,
+  updateEmployeeId,
   getWallProduction,
   recordWallProduction,
   correctWallProduction,
@@ -12,7 +14,11 @@ import {
 import type { AttendanceRecord, Operator, WallProductionRecord, WallProductionTotal } from "../types";
 import "./AttendanceCard.css";
 
-export function AttendanceCard() {
+interface Props {
+  onOpenReport?: () => void;
+}
+
+export function AttendanceCard({ onOpenReport }: Props = {}) {
   const [activeTab, setActiveTab] = useState<"attendance" | "production">("attendance");
   const [operators, setOperators] = useState<Operator[]>([]);
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
@@ -23,8 +29,13 @@ export function AttendanceCard() {
   // New Employee State
   const [isAdding, setIsAdding] = useState(false);
   const [newName, setNewName] = useState("");
-  const [newCode, setNewCode] = useState("");
+  const [newEmployeeId, setNewEmployeeId] = useState("");
+  const [newEmployeeCode, setNewEmployeeCode] = useState("");
   const [newRole, setNewRole] = useState("operator");
+
+  // Update Employee ID Modal State
+  const [updatingOp, setUpdatingOp] = useState<Operator | null>(null);
+  const [updatedIdInput, setUpdatedIdInput] = useState("");
 
   // Wall Production State
   const [prodScope, setProdScope] = useState<"today" | "this_week" | "all_time">("today");
@@ -113,22 +124,85 @@ export function AttendanceCard() {
       setError("Employee name is required.");
       return;
     }
+    const cleanEid = newEmployeeId.trim() || undefined;
+    const cleanCode = newEmployeeCode.trim() || undefined;
+
+    if (cleanEid && !/^K6K\d+$/i.test(cleanEid)) {
+      setError("Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format.");
+      return;
+    }
+    if (cleanCode && !/^\d+$/.test(cleanCode)) {
+      setError("Employee code must contain only numbers. Please enter the code correctly.");
+      return;
+    }
+
     try {
       const res = await createOperator({
         name: newName,
-        employee_code: newCode.trim() || undefined,
+        Employee_id: cleanEid ? cleanEid.toUpperCase() : undefined,
+        employee_code: cleanCode,
         role: newRole,
         active: 1,
       });
       await fetchOperators();
       setIsAdding(false);
-      setSelectedOp(res.operator_id);
+      setSelectedOp(String(res.operator_id));
       setNewName("");
-      setNewCode("");
-      const eidText = res.eid ? ` (ID: ${res.eid})` : "";
+      setNewEmployeeId("");
+      setNewEmployeeCode("");
+      const eidText = cleanEid ? ` (ID: ${cleanEid.toUpperCase()})` : cleanCode ? ` (Code: ${cleanCode})` : "";
       setSuccessMsg(`Employee "${newName}"${eidText} registered successfully.`);
     } catch (err: any) {
       setError(err.message || "Failed to create employee.");
+    }
+  };
+
+  const handleUpdateEmployeeId = async () => {
+    if (!updatingOp) return;
+    setError(null);
+    setSuccessMsg(null);
+    const cleanId = updatedIdInput.trim();
+    if (!cleanId) {
+      setError("New Employee ID is required.");
+      return;
+    }
+    if (!/^K6K\d+$/i.test(cleanId)) {
+      setError("Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format.");
+      return;
+    }
+    try {
+      const res = await updateEmployeeId(String(updatingOp.operator_id), cleanId.toUpperCase());
+      await fetchOperators();
+      await fetchRecords();
+      setSuccessMsg(res.message || `Updated Employee ID to ${cleanId.toUpperCase()} and cleared employee code.`);
+      setUpdatingOp(null);
+      setUpdatedIdInput("");
+    } catch (err: any) {
+      setError(err.message || "Failed to update Employee ID.");
+    }
+  };
+
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [operatorToDelete, setOperatorToDelete] = useState<Operator | null>(null);
+
+  const handleDeleteOperator = async () => {
+    if (!operatorToDelete) return;
+    setError(null);
+    setSuccessMsg(null);
+    setIsDeleting(true);
+    try {
+      const res = await deleteOperator(String(operatorToDelete.operator_id));
+      await fetchOperators();
+      await fetchRecords();
+      if (selectedOp === String(operatorToDelete.operator_id)) {
+        setSelectedOp("");
+      }
+      setSuccessMsg(res.message || `Operator "${operatorToDelete.name}" deleted successfully.`);
+      setOperatorToDelete(null);
+    } catch (err: any) {
+      setError(err.message || "Failed to delete operator.");
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -136,7 +210,8 @@ export function AttendanceCard() {
     setIsAdding(false);
     setSelectedOp("");
     setNewName("");
-    setNewCode("");
+    setNewEmployeeId("");
+    setNewEmployeeCode("");
     setError(null);
   };
 
@@ -150,7 +225,8 @@ export function AttendanceCard() {
       }
       await checkInAttendance(selectedOp, undefined);
       setSelectedOp("");
-      fetchRecords();
+      await fetchRecords();
+      await fetchOperators();
       setSuccessMsg("Shift started successfully.");
     } catch (err: any) {
       setError(err.message || "Failed to check in.");
@@ -162,7 +238,8 @@ export function AttendanceCard() {
     setSuccessMsg(null);
     try {
       await checkOutAttendance(record.operator_id, undefined);
-      fetchRecords();
+      await fetchRecords();
+      await fetchOperators();
       setSuccessMsg(`Shift ended for ${record.employee_name}.`);
     } catch (err: any) {
       setError(err.message || "Failed to check out.");
@@ -256,22 +333,43 @@ export function AttendanceCard() {
           <span className="att-sqlite-badge">SQLITE RECORD</span>
         </div>
 
-        {/* Tab Toggle */}
-        <div className="att-tabs">
-          <button
-            type="button"
-            onClick={() => setActiveTab("attendance")}
-            className={`att-tab-btn ${activeTab === "attendance" ? "att-tab-btn-active-attendance" : ""}`}
-          >
-            📋 Shifts
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("production")}
-            className={`att-tab-btn ${activeTab === "production" ? "att-tab-btn-active-production" : ""}`}
-          >
-            🧱 Walls ({wallTotals?.total_quantity ?? 0})
-          </button>
+        {/* Tab Toggle & Report Dashboard Button */}
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          {onOpenReport && (
+            <button
+              type="button"
+              onClick={onOpenReport}
+              className="att-tab-btn"
+              style={{
+                background: "rgba(56, 189, 248, 0.12)",
+                color: "#38bdf8",
+                borderColor: "rgba(56, 189, 248, 0.35)",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "5px",
+                fontWeight: 700,
+              }}
+              title="Open Attendance Report Dashboard in this page"
+            >
+              📊 Attendance Report
+            </button>
+          )}
+          <div className="att-tabs">
+            <button
+              type="button"
+              onClick={() => setActiveTab("attendance")}
+              className={`att-tab-btn ${activeTab === "attendance" ? "att-tab-btn-active-attendance" : ""}`}
+            >
+              📋 Shifts
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("production")}
+              className={`att-tab-btn ${activeTab === "production" ? "att-tab-btn-active-production" : ""}`}
+            >
+              🧱 Walls ({wallTotals?.total_quantity ?? 0})
+            </button>
+          </div>
         </div>
       </div>
 
@@ -347,6 +445,37 @@ export function AttendanceCard() {
                 >
                   START SHIFT
                 </button>
+
+                {selectedOp && selectedOp !== "ADD_NEW" && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const op = operators.find((o) => String(o.operator_id) === String(selectedOp));
+                        if (op) {
+                          setUpdatingOp(op);
+                          setUpdatedIdInput(op.Employee_id || op.eid || "");
+                        }
+                      }}
+                      className="att-btn-action"
+                      style={{ background: "rgba(56, 189, 248, 0.15)", color: "#38bdf8", border: "1px solid rgba(56, 189, 248, 0.3)", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "11px", fontWeight: 600 }}
+                      title="Update Employee ID & clear employee code"
+                    >
+                      ✏️ EDIT ID
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const op = operators.find((o) => String(o.operator_id) === String(selectedOp));
+                        if (op) setOperatorToDelete(op);
+                      }}
+                      className="att-btn-delete-op"
+                      title="Delete selected operator"
+                    >
+                      🗑️ DELETE
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           ) : (
@@ -356,8 +485,8 @@ export function AttendanceCard() {
               </h4>
 
               <div className="att-eid-badge">
-                <span style={{ fontSize: "11px", color: "var(--muted)" }}>Employee ID (EID):</span>
-                <span style={{ fontSize: "11px", color: "#38bdf8", fontWeight: 700, fontFamily: "monospace" }}>AUTO-GENERATED (K6K...)</span>
+                <span style={{ fontSize: "11px", color: "var(--muted)" }}>Employee ID:</span>
+                <span style={{ fontSize: "11px", color: "#38bdf8", fontWeight: 600 }}>Enter your ID or last 4 digits of mobile</span>
               </div>
 
               <div>
@@ -375,13 +504,26 @@ export function AttendanceCard() {
 
               <div>
                 <label style={{ fontSize: "11px", color: "var(--muted)", display: "block", marginBottom: "4px" }}>
-                  Employee Code (Optional)
+                  Employee ID (optional, leave blank if none)
                 </label>
                 <input
                   type="text"
-                  value={newCode}
-                  placeholder="e.g. OP-104"
-                  onChange={(e) => setNewCode(e.target.value)}
+                  value={newEmployeeId}
+                  placeholder="e.g. K6K001"
+                  onChange={(e) => setNewEmployeeId(e.target.value)}
+                  className="att-input"
+                />
+              </div>
+
+              <div>
+                <label style={{ fontSize: "11px", color: "var(--muted)", display: "block", marginBottom: "4px" }}>
+                  Employee Code (optional, e.g. 4-digit mobile suffix)
+                </label>
+                <input
+                  type="text"
+                  value={newEmployeeCode}
+                  placeholder="e.g. 9454 (leave blank if none)"
+                  onChange={(e) => setNewEmployeeCode(e.target.value)}
                   className="att-input"
                 />
               </div>
@@ -452,19 +594,20 @@ export function AttendanceCard() {
               <table className="att-table">
                 <thead>
                   <tr>
-                    <th>EID</th>
+                    <th>Employee ID</th>
                     <th>Employee</th>
                     <th>Start</th>
                     <th>End</th>
                     <th>Worked</th>
                     <th>Overtime</th>
                     <th>Status</th>
+                    <th style={{ textAlign: "right" }}>Action</th>
                   </tr>
                 </thead>
                 <tbody>
                   {records.length === 0 ? (
                     <tr>
-                      <td colSpan={7} style={{ textAlign: "center", padding: "18px", color: "var(--muted)" }}>
+                      <td colSpan={8} style={{ textAlign: "center", padding: "18px", color: "var(--muted)" }}>
                         No attendance records for today.
                       </td>
                     </tr>
@@ -472,7 +615,7 @@ export function AttendanceCard() {
                     records.map((r) => (
                       <tr key={r.id}>
                         <td className="att-eid-cell">
-                          {r.eid || "—"}
+                          {r.Employee_id || r.eid || "—"}
                         </td>
                         <td className="att-emp-name">{r.employee_name}</td>
                         <td className="att-time-cell">
@@ -516,6 +659,29 @@ export function AttendanceCard() {
                             )}
                           </div>
                         </td>
+                        <td style={{ textAlign: "right" }}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const found = operators.find(
+                                (o) => o.operator_id === r.operator_id || (r.eid && o.employee_code === r.eid) || o.name === r.employee_name
+                              ) || {
+                                operator_id: r.operator_id || r.eid || "",
+                                name: r.employee_name,
+                                employee_code: r.eid,
+                                role: "operator",
+                                active: 1,
+                              };
+                              if (found.operator_id) {
+                                setOperatorToDelete(found as Operator);
+                              }
+                            }}
+                            className="att-btn-delete-row"
+                            title={`Delete operator ${r.employee_name}`}
+                          >
+                            🗑️
+                          </button>
+                        </td>
                       </tr>
                     ))
                   )}
@@ -523,6 +689,112 @@ export function AttendanceCard() {
               </table>
             </div>
           </div>
+          {/* Operator Delete Confirmation Modal */}
+          {updatingOp && (
+        <div className="att-modal-overlay">
+          <div className="att-modal">
+            <h4 style={{ margin: "0 0 12px 0", color: "#38bdf8", fontSize: "14px", fontWeight: 700 }}>
+              UPDATE EMPLOYEE ID
+            </h4>
+            <p style={{ fontSize: "12px", color: "var(--muted)", marginBottom: "12px" }}>
+              Updating Employee ID for <strong>{updatingOp.name}</strong>. Their previous employee code will be cleared.
+            </p>
+            <div style={{ marginBottom: "16px" }}>
+              <label style={{ fontSize: "11px", color: "var(--muted)", display: "block", marginBottom: "4px" }}>
+                New Employee ID
+              </label>
+              <input
+                type="text"
+                value={updatedIdInput}
+                placeholder="e.g. K6K999"
+                onChange={(e) => setUpdatedIdInput(e.target.value)}
+                className="att-input"
+                style={{ width: "100%" }}
+              />
+            </div>
+            <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setUpdatingOp(null);
+                  setUpdatedIdInput("");
+                }}
+                className="att-btn-cancel"
+              >
+                CANCEL
+              </button>
+              <button
+                type="button"
+                onClick={handleUpdateEmployeeId}
+                className="att-btn-save"
+                style={{ background: "#0284c7", color: "#fff" }}
+              >
+                SAVE NEW ID
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {operatorToDelete && (
+            <div className="modal-overlay" onClick={() => !isDeleting && setOperatorToDelete(null)}>
+              <div className="modal-box" onClick={(e) => e.stopPropagation()} style={{ maxWidth: "420px" }}>
+                <div className="modal-header">
+                  <h3 className="modal-title" style={{ color: "#ef4444" }}>
+                    <span>⚠️</span>
+                    <span>Confirm Operator Deletion</span>
+                  </h3>
+                  <button
+                    type="button"
+                    className="modal-close-btn"
+                    onClick={() => !isDeleting && setOperatorToDelete(null)}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div className="modal-info-block" style={{ borderLeftColor: "#ef4444" }}>
+                  <div><strong>Operator:</strong> {operatorToDelete.name}</div>
+                  <div><strong>ID:</strong> {operatorToDelete.operator_id}</div>
+                  {operatorToDelete.employee_code && (
+                    <div><strong>Code:</strong> {operatorToDelete.employee_code}</div>
+                  )}
+                </div>
+
+                <p style={{ fontSize: "12px", color: "#f87171", margin: "12px 0", lineHeight: 1.5 }}>
+                  This will permanently delete <strong>{operatorToDelete.name}</strong> from the operators list and database, along with their related shift records.
+                </p>
+
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="modal-btn-cancel"
+                    onClick={() => setOperatorToDelete(null)}
+                    disabled={isDeleting}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    style={{
+                      padding: "8px 16px",
+                      borderRadius: "6px",
+                      border: "none",
+                      background: "#ef4444",
+                      color: "#fff",
+                      fontWeight: 600,
+                      cursor: isDeleting ? "not-allowed" : "pointer",
+                      opacity: isDeleting ? 0.7 : 1,
+                    }}
+                    onClick={handleDeleteOperator}
+                    disabled={isDeleting}
+                  >
+                    {isDeleting ? "Deleting..." : "Permanently Delete"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

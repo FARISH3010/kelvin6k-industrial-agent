@@ -165,7 +165,8 @@ def resolve_employee(
     try:
         with db.connect(db_path) as conn:
             sql = "SELECT * FROM operators"
-            if active_only:
+            cols = [c[1] for c in conn.execute('PRAGMA table_info(operators)').fetchall()]
+            if active_only and 'status' in cols:
                 sql += " WHERE status = 'Active'"
             rows = [dict(r) for r in conn.execute(sql)]
     except Exception as exc:
@@ -184,9 +185,10 @@ def resolve_employee(
         r_name = normalize_name(r.get("name", ""))
         r_first = r_name.split()[0] if r_name else ""
         r_code = normalize_name(r.get("employee_code", "") or "")
+        r_eid = normalize_name(r.get("Employee_id", "") or "")
         r_id = normalize_name(r.get("operator_id", "") or "")
 
-        if norm_cand in (r_name, r_first, r_code, r_id) or canon_cand in (r_name, r_first, r_code, r_id):
+        if norm_cand in (r_name, r_first, r_code, r_eid, r_id) or canon_cand in (r_name, r_first, r_code, r_eid, r_id):
             exact_matches.append(r)
         else:
             # Check for near-identical alternate transliterations (e.g. Hamdan vs Hamdaan)
@@ -295,3 +297,4 @@ def resolve_employee(
         candidate_name=candidate_name,
         message=f"Matched operator {top_op['name']} (confidence {top_score:.2f}).",
     )
+

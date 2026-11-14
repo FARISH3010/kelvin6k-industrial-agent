@@ -159,7 +159,7 @@ export function getTtsDiagnostics(): Promise<TtsDiagnostics> {
 // --- Attendance ---
 
 
-export async function checkInAttendance(employee_id?: string, employee_name?: string): Promise<AttendanceRecord> {
+export async function checkInAttendance(employee_id?: string | number, employee_name?: string): Promise<AttendanceRecord> {
   const response = await fetch(`${API_BASE}/api/v1/attendance/check-in`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -172,7 +172,7 @@ export async function checkInAttendance(employee_id?: string, employee_name?: st
   return response.json();
 }
 
-export async function checkOutAttendance(employee_id?: string, employee_name?: string): Promise<AttendanceRecord> {
+export async function checkOutAttendance(employee_id?: string | number, employee_name?: string): Promise<AttendanceRecord> {
   const response = await fetch(`${API_BASE}/api/v1/attendance/check-out`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -194,7 +194,20 @@ export async function getOperators(): Promise<{ operators: Operator[] }> {
   return getJson<{ operators: Operator[] }>("/api/operators");
 }
 
-export async function createOperator(data: { name: string; employee_code?: string; role: string; active: number }): Promise<Operator> {
+export async function updateEmployeeId(operatorNameOrId: string, newEmployeeId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/operators/update-id`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_name_or_id: operatorNameOrId, new_employee_id: newEmployeeId }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Failed to update Employee ID" }));
+    throw new Error(error.detail || "Failed to update Employee ID");
+  }
+  return res.json();
+}
+
+export async function createOperator(data: { name: string; employee_code?: string; Employee_id?: string; role: string; active: number }): Promise<Operator> {
   const res = await fetch(`${API_BASE}/api/operators`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -205,6 +218,25 @@ export async function createOperator(data: { name: string; employee_code?: strin
     throw new Error(error.detail || "Failed to create operator.");
   }
   return res.json();
+}
+
+export async function deleteOperator(operatorId: string): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`${API_BASE}/api/operators/${encodeURIComponent(operatorId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const error = await res.json();
+    throw new Error(error.detail || "Failed to delete operator.");
+  }
+  return res.json();
+}
+
+export async function getAttendanceReport(date?: string, operatorId?: string): Promise<import("./types").AttendanceReportResponse> {
+  const params = new URLSearchParams();
+  if (date) params.append("date", date);
+  if (operatorId) params.append("operator_id", operatorId);
+  const q = params.toString() ? `?${params.toString()}` : "";
+  return getJson<import("./types").AttendanceReportResponse>(`/api/reports/attendance${q}`);
 }
 
 /**

@@ -16,7 +16,7 @@ from agent.logging_setup import get_logger
 log = get_logger("ShiftStore")
 
 
-def _row_to_dict(row: Optional[Any]) -> Optional[Dict[str, Any]]:
+def _row_to_dict(row: Optional[Any], db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if row is None:
         return None
     d = dict(row)
@@ -25,6 +25,21 @@ def _row_to_dict(row: Optional[Any]) -> Optional[Dict[str, Any]]:
         if not d.get("current_work_status"):
             d["current_work_status"] = "Off Shift"
         d.setdefault("active_shift_id", None)
+        d.setdefault("assigned_line", "line_1")
+        d.setdefault("status", "Active")
+        d.setdefault("active", 1)
+        if d.get("current_work_status") in ("Working", "On Break") and d.get("active_shift_id") is None:
+            try:
+                op_id = d["operator_id"]
+                with db.connect(db_path) as conn:
+                    ashift = conn.execute(
+                        "SELECT shift_id FROM shifts WHERE (operator_id = ? OR CAST(operator_id AS TEXT) = ?) AND status IN ('active', 'Active') ORDER BY start_time DESC LIMIT 1",
+                        (op_id, str(op_id)),
+                    ).fetchone()
+                    if ashift:
+                        d["active_shift_id"] = ashift["shift_id"]
+            except Exception:
+                pass
     return d
 
 
@@ -42,15 +57,19 @@ def sync_attendance_start(
     try:
         op = get_operator(operator_id, db_path)
         op_id_str = str(op.get("operator_id") or operator_id) if op else str(operator_id)
-        eid = str(op.get("eid") or op.get("employee_code") or op_id_str) if op else op_id_str
+        eid = str(op.get("Employee_id") or op.get("eid") or op.get("employee_code") or op_id_str) if op else op_id_str
         emp_name = str(op.get("name") or op_id_str) if op else op_id_str
         att_date = shift_date or datetime.date.fromtimestamp(start_ts).isoformat()
 
         with db.connect(db_path) as conn:
+            att_cols = [c[1] for c in conn.execute("PRAGMA table_info(attendance_records)").fetchall()]
+            has_emp_id = "Employee_id" in att_cols
+            id_col = "Employee_id" if has_emp_id else "eid"
+
             existing = conn.execute(
-                """
+                f"""
                 SELECT id FROM attendance_records
-                WHERE (operator_id = ? OR eid = ? OR employee_name = ? COLLATE NOCASE)
+                WHERE (operator_id = ? OR {id_col} = ? OR employee_name = ? COLLATE NOCASE)
                   AND attendance_date = ? AND status = 'ACTIVE'
                 LIMIT 1
                 """,
@@ -58,9 +77,9 @@ def sync_attendance_start(
             ).fetchone()
             if not existing:
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO attendance_records (
-                        operator_id, eid, employee_name, attendance_date,
+                        operator_id, {id_col}, employee_name, attendance_date,
                         shift_start, shift_end, status, created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, NULL, 'ACTIVE', ?, ?)
                     """,
@@ -81,14 +100,17 @@ def sync_attendance_end(
     try:
         op = get_operator(operator_id, db_path)
         op_id_str = str(op.get("operator_id") or operator_id) if op else str(operator_id)
-        eid = str(op.get("eid") or op.get("employee_code") or op_id_str) if op else op_id_str
+        eid = str(op.get("Employee_id") or op.get("eid") or op.get("employee_code") or op_id_str) if op else op_id_str
         emp_name = str(op.get("name") or op_id_str) if op else op_id_str
 
         with db.connect(db_path) as conn:
+            att_cols = [c[1] for c in conn.execute("PRAGMA table_info(attendance_records)").fetchall()]
+            id_col = "Employee_id" if "Employee_id" in att_cols else "eid"
+
             row = conn.execute(
-                """
+                f"""
                 SELECT id FROM attendance_records
-                WHERE (operator_id = ? OR eid = ? OR employee_name = ? COLLATE NOCASE)
+                WHERE (operator_id = ? OR {id_col} = ? OR employee_name = ? COLLATE NOCASE)
                   AND status = 'ACTIVE'
                 ORDER BY shift_start DESC
                 LIMIT 1
@@ -136,6 +158,30 @@ def _format_hh_mm(val: Any) -> Optional[str]:
 # 1. Operators
 # ===========================================================================
 
+def get_next_operator_id(db_path: Optional[str] = None) -> int:
+    """
+    Finds the highest existing integer operator_id in operators table
+    and returns the next sequential number (e.g. 1, 2, 3, 4, 5, etc).
+    """
+    max_id = 0
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT operator_id FROM operators").fetchall()
+        for r in rows:
+            val = r["operator_id"]
+            if val is not None:
+                try:
+                    num = int(val)
+                    if num > max_id:
+                        max_id = num
+                except (ValueError, TypeError):
+                    pass
+    return max(1, max_id + 1)
+
+
+# Alias for backwards compatibility
+get_next_operator_code = get_next_operator_id
+
+
 def create_operator(
     operator_id: Optional[Any] = None,
     name: Optional[str] = None,
@@ -146,7 +192,7 @@ def create_operator(
     db_path: Optional[str] = None,
     **kwargs: Any,
 ) -> Any:
-    """Creates a new operator record. Primary key: operator_id."""
+    """Creates a new operator record. Primary key: operator_id (integer serial)."""
     # If role was passed as integer (e.g. active flag):
     if isinstance(role, int):
         active = role
@@ -154,63 +200,131 @@ def create_operator(
 
     # Support positional name if operator_id is passed as name:
     if operator_id is not None and name is None:
-        if isinstance(operator_id, str) and not operator_id.startswith("OP_") and not any(ch.isdigit() for ch in operator_id):
+        if isinstance(operator_id, str) and not operator_id.isdigit():
             name = operator_id
             operator_id = None
         else:
-            name = str(operator_id)
+            try:
+                operator_id = int(operator_id)
+            except (ValueError, TypeError):
+                name = str(operator_id)
+                operator_id = None
 
     if not name or not str(name).strip():
         raise ValueError("name cannot be empty")
     clean_name = str(name).strip()
-    clean_emp = employee_code.strip() if employee_code else None
+    
+    # Determine Employee_id vs employee_code distinctly
+    raw_eid = kwargs.get("Employee_id") or kwargs.get("eid")
+    raw_code = employee_code
+    clean_eid = str(raw_eid).strip() if (raw_eid is not None and str(raw_eid).strip()) else None
+    clean_code = str(raw_code).strip() if (raw_code is not None and str(raw_code).strip()) else None
+
+    # Invariant: employee_code should not be stored in Employee_id.
+    # Whenever a user has an Employee_id, it is stored in Employee_id and employee_code MUST be blank.
+    if clean_eid:
+        clean_code = None
+
+    # Backward compatibility: if string operator_id provided (e.g. 'OP_ANAND') and neither eid nor code provided
+    if operator_id is not None and not str(operator_id).isdigit():
+        str_op = str(operator_id).strip()
+        if not clean_eid and not clean_code:
+            clean_code = str_op
+
     if active not in (0, 1):
         raise ValueError("active must be 0 or 1")
     op_status = status or ("Active" if active == 1 else "Inactive")
     op_active = active if status is None else (1 if str(op_status).lower() == "active" else 0)
     clean_role = str(role).strip() if role else "Operator"
 
-    now = time.time()
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db.connect(db_path) as conn:
         if operator_id is None:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(CAST(operator_id AS INTEGER)), 0) AS max_id FROM operators"
-            ).fetchone()
-            candidate_id = max(1, int(row["max_id"]) + 1)
-            while conn.execute("SELECT 1 FROM operators WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (candidate_id, str(candidate_id))).fetchone():
-                candidate_id += 1
-            clean_id = candidate_id
+            clean_id = get_next_operator_id(db_path)
         else:
-            clean_id = operator_id.strip() if isinstance(operator_id, str) else operator_id
+            try:
+                clean_id = int(operator_id)
+            except (ValueError, TypeError):
+                clean_id = get_next_operator_id(db_path)
 
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        has_employee_id = "Employee_id" in cols
+        
+        fields = ["operator_id", "name", "role", "employee_code", "created_at", "current_work_status"]
+        vals = [clean_id, clean_name, clean_role, clean_code, now_str, "Off Shift"]
+        if has_employee_id:
+            fields.append("Employee_id")
+            vals.append(clean_eid)
+        if "status" in cols:
+            fields.append("status")
+            vals.append(op_status)
+        if "active" in cols:
+            fields.append("active")
+            vals.append(op_active)
+        placeholders = ", ".join(["?"] * len(fields))
+        field_str = ", ".join(fields)
         conn.execute(
-            """
-            INSERT INTO operators (operator_id, name, employee_code, role, status, active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (clean_id, clean_name, clean_emp, clean_role, op_status, op_active, now),
+            f"INSERT INTO operators ({field_str}) VALUES ({placeholders})",
+            vals,
         )
-    log.info("Created operator: %s (%s)", clean_id, clean_name)
+    log.info("Created operator: %s (%s, Employee_id=%s, employee_code=%s)", clean_id, clean_name, clean_eid, clean_code)
     return clean_id
 
 
 def get_operator(operator_id: Any, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Retrieves an operator by operator_id, employee_code, or name."""
+    """Retrieves an operator by operator_id, Employee_id, employee_code, or name."""
     if operator_id is None:
         return None
     with db.connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM operators
-            WHERE operator_id = ?
-               OR CAST(operator_id AS TEXT) = ?
-               OR employee_code = ?
-               OR name = ? COLLATE NOCASE
-            LIMIT 1
-            """,
-            (operator_id, str(operator_id), str(operator_id), str(operator_id)),
-        ).fetchone()
-    return _row_to_dict(row)
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        has_employee_id = "Employee_id" in cols
+        s_op = str(operator_id).strip()
+        like_op = f"%{s_op}%"
+        if has_employee_id:
+            row = conn.execute(
+                """
+                SELECT * FROM operators
+                WHERE operator_id = ?
+                   OR CAST(operator_id AS TEXT) = ?
+                   OR Employee_id = ?
+                   OR employee_code = ?
+                   OR name = ? COLLATE NOCASE
+                LIMIT 1
+                """,
+                (operator_id, s_op, s_op, s_op, s_op),
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    """
+                    SELECT * FROM operators
+                    WHERE Employee_id LIKE ?
+                       OR employee_code LIKE ?
+                    LIMIT 1
+                    """,
+                    (like_op, like_op),
+                ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM operators
+                WHERE operator_id = ?
+                   OR CAST(operator_id AS TEXT) = ?
+                   OR employee_code = ?
+                   OR name = ? COLLATE NOCASE
+                LIMIT 1
+                """,
+                (operator_id, s_op, s_op, s_op),
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    """
+                    SELECT * FROM operators
+                    WHERE employee_code LIKE ?
+                    LIMIT 1
+                    """,
+                    (like_op,),
+                ).fetchone()
+    return _row_to_dict(row, db_path)
 
 
 _OPERATOR_ALIASES: Dict[str, str] = {
@@ -244,20 +358,27 @@ def find_operator_by_name(
     canonical = _OPERATOR_ALIASES.get(clean, clean).lower()
 
     with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
         sql = "SELECT * FROM operators"
-        if active_only:
-            sql += " WHERE (active = 1 OR status = 'Active')"
-        rows = [dict(r) for r in conn.execute(sql)]
+        if active_only and ("active" in cols or "status" in cols):
+            clauses = []
+            if "active" in cols:
+                clauses.append("active = 1")
+            if "status" in cols:
+                clauses.append("status = 'Active'")
+            sql += " WHERE (" + " OR ".join(clauses) + ")"
+        rows = [_row_to_dict(r, db_path) for r in conn.execute(sql)]
 
     # 1. Exact match against clean or canonical
     exact = [
         r for r in rows
         if (r.get("name") or "").strip().lower() in (clean, canonical)
+        or (r.get("Employee_id") or "").strip().lower() in (clean, canonical)
         or (r.get("employee_code") or "").strip().lower() in (clean, canonical)
         or str(r.get("operator_id") or "").strip().lower() in (clean, canonical)
     ]
     if len(exact) == 1:
-        return exact[0]
+        return _row_to_dict(exact[0], db_path)
     if len(exact) > 1:
         log.warning("Spoken name %r matches %d operators; refusing to guess.", name, len(exact))
         return None
@@ -268,7 +389,7 @@ def find_operator_by_name(
         if (r.get("name") or "").strip().lower().split(" ")[0] in (clean, canonical)
     ]
     if len(first) == 1:
-        return first[0]
+        return _row_to_dict(first[0], db_path)
     if len(first) > 1:
         log.warning("Spoken first name %r matches %d operators; refusing to guess.", name, len(first))
         return None
@@ -288,17 +409,36 @@ def find_operator_by_name(
                 (cid, cname),
             ).fetchone()
             if existing:
-                return _row_to_dict(existing)
+                return _row_to_dict(existing, db_path)
             try:
-                conn.execute(
-                    """
-                    INSERT INTO operators (operator_id, name, employee_code, role, status, active, current_work_status)
-                    VALUES (?, ?, ?, ?, 'Active', 1, 'Off Shift')
-                    """,
-                    (cid, cname, ccode, crole),
-                )
-                created = conn.execute("SELECT * FROM operators WHERE operator_id = ?", (cid,)).fetchone()
-                return _row_to_dict(created)
+                cols_info = {c[1]: c[2] for c in conn.execute("PRAGMA table_info(operators)").fetchall()}
+                ins_cols = ["name", "role", "current_work_status"]
+                ins_vals = [cname, crole, "Off Shift"]
+                if "INTEGER" not in cols_info.get("operator_id", "").upper():
+                    ins_cols.insert(0, "operator_id")
+                    ins_vals.insert(0, cid)
+                if "Employee_id" in cols_info:
+                    ins_cols.append("Employee_id")
+                    ins_vals.append(ccode)
+                    # employee_code must be blank when Employee_id is present
+                elif "employee_code" in cols_info:
+                    ins_cols.append("employee_code")
+                    ins_vals.append(ccode)
+                if "status" in cols_info:
+                    ins_cols.append("status")
+                    ins_vals.append("Active")
+                if "active" in cols_info:
+                    ins_cols.append("active")
+                    ins_vals.append(1)
+                if "assigned_line" in cols_info:
+                    ins_cols.append("assigned_line")
+                    ins_vals.append("line_1")
+                placeholders = ", ".join(["?"] * len(ins_vals))
+                col_str = ", ".join(ins_cols)
+                cur = conn.execute(f"INSERT INTO operators ({col_str}) VALUES ({placeholders})", ins_vals)
+                last_id = cur.lastrowid
+                created = conn.execute("SELECT * FROM operators WHERE operator_id = ? OR name = ? COLLATE NOCASE", (last_id, cname)).fetchone()
+                return _row_to_dict(created, db_path)
             except Exception as exc:
                 log.warning("Could not auto-register core operator %s: %s", cname, exc)
 
@@ -321,10 +461,16 @@ def find_operators_matching_name(
     canonical = _OPERATOR_ALIASES.get(clean, clean).lower()
 
     with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
         sql = "SELECT * FROM operators"
-        if active_only:
-            sql += " WHERE (active = 1 OR status = 'Active')"
-        rows = [dict(r) for r in conn.execute(sql)]
+        if active_only and ("active" in cols or "status" in cols):
+            clauses = []
+            if "active" in cols:
+                clauses.append("active = 1")
+            if "status" in cols:
+                clauses.append("status = 'Active'")
+            sql += " WHERE (" + " OR ".join(clauses) + ")"
+        rows = [_row_to_dict(r, db_path) for r in conn.execute(sql)]
 
     # If rows empty and query is a core operator/alias, let find_operator_by_name seed it
     if not rows and canonical in ("lukhmaan", "farish", "hamdaan", "anand sharma"):
@@ -336,6 +482,7 @@ def find_operators_matching_name(
     exact = [
         r for r in rows
         if (r.get("name") or "").strip().lower() in (clean, canonical)
+        or (r.get("Employee_id") or "").strip().lower() in (clean, canonical)
         or (r.get("employee_code") or "").strip().lower() in (clean, canonical)
         or str(r.get("operator_id") or "").strip().lower() in (clean, canonical)
     ]
@@ -497,20 +644,26 @@ def get_operator_by_employee_code(employee_code: str, db_path: Optional[str] = N
             "SELECT * FROM operators WHERE employee_code = ?",
             (employee_code.strip(),),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def list_operators(active_only: bool = True, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Lists operators, optionally filtering by active."""
-    query = "SELECT * FROM operators"
-    params: List[Any] = []
-    if active_only:
-        query += " WHERE active = 1"
-    query += " ORDER BY name ASC"
-
     with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        query = "SELECT * FROM operators"
+        params: List[Any] = []
+        if active_only and "active" in cols:
+            query += " WHERE active = 1"
+        query += " ORDER BY name ASC"
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    res = []
+    for r in rows:
+        d = dict(r)
+        if "Employee_id" in d:
+            d["eid"] = d["Employee_id"]
+        res.append(d)
+    return res
 
 
 def update_operator(
@@ -519,9 +672,11 @@ def update_operator(
     employee_code: Optional[str] = None,
     role: Optional[str] = None,
     active: Optional[int] = None,
+    Employee_id: Optional[str] = None,
+    clear_employee_code: bool = False,
     db_path: Optional[str] = None,
 ) -> bool:
-    """Updates mutable operator fields."""
+    """Updates mutable operator fields. If Employee_id is updated or clear_employee_code is True, clears employee_code."""
     sets, params = [], []
     if name is not None:
         clean_name = name.strip()
@@ -529,28 +684,330 @@ def update_operator(
             raise ValueError("name cannot be empty")
         sets.append("name = ?")
         params.append(clean_name)
-    if employee_code is not None:
+    if Employee_id is not None:
+        clean_eid = Employee_id.strip() if Employee_id else None
+        sets.append("Employee_id = ?")
+        params.append(clean_eid)
+        if clean_eid:
+            # When updating to a new Employee_id, clear employee_code
+            sets.append("employee_code = NULL")
+    elif clear_employee_code:
+        sets.append("employee_code = NULL")
+    elif employee_code is not None:
         sets.append("employee_code = ?")
         params.append(employee_code.strip() if employee_code else None)
+
     if role is not None:
         sets.append("role = ?")
         params.append(role.strip())
-    if active is not None:
-        if active not in (0, 1):
-            raise ValueError("active must be 0 or 1")
-        sets.append("active = ?")
-        params.append(active)
-
-    if not sets:
-        return False
-
-    params.append(operator_id.strip())
     with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        if active is not None and "active" in cols:
+            if active not in (0, 1):
+                raise ValueError("active must be 0 or 1")
+            sets.append("active = ?")
+            params.append(active)
+        if not sets:
+            return True
+        params.append(str(operator_id).strip())
         cur = conn.execute(
             f"UPDATE operators SET {', '.join(sets)} WHERE operator_id = ?",
             params,
         )
         return cur.rowcount > 0
+
+
+def update_employee_id(
+    operator_name_or_id: str,
+    new_employee_id: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Updates an employee's Employee_id to a new ID, and clears their employee_code.
+    """
+    clean_target = str(operator_name_or_id).strip()
+    clean_new_id = str(new_employee_id).strip().upper()
+    if not clean_target:
+        return {"success": False, "error": "Operator name or ID required."}
+    if not clean_new_id:
+        return {"success": False, "error": "New Employee_id required."}
+    if not re.fullmatch(r"K6K\d+", clean_new_id):
+        return {
+            "success": False,
+            "error": f"Invalid Employee ID '{clean_new_id}'. Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format.",
+        }
+
+    op = get_operator(clean_target, db_path)
+    if not op:
+        op = find_operator_by_name(clean_target, active_only=False, db_path=db_path)
+    if not op:
+        matches = find_operators_matching_name(clean_target, active_only=False, db_path=db_path)
+        if matches:
+            op = matches[0]
+
+    if not op:
+        return {"success": False, "error": f"Operator '{clean_target}' not found."}
+
+    op_id = op["operator_id"]
+    with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        sets = []
+        params = []
+        if "Employee_id" in cols:
+            sets.append("Employee_id = ?")
+            params.append(clean_new_id)
+        if "employee_code" in cols:
+            sets.append("employee_code = NULL")
+        if sets:
+            params.append(op_id)
+            conn.execute(f"UPDATE operators SET {', '.join(sets)} WHERE operator_id = ?", params)
+
+        # Update eid in attendance_records if present
+        att_cols = [c[1] for c in conn.execute("PRAGMA table_info(attendance_records)").fetchall()]
+        if "eid" in att_cols:
+            conn.execute("UPDATE attendance_records SET eid = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (clean_new_id, op_id, str(op_id)))
+        if "Employee_id" in att_cols:
+            conn.execute("UPDATE attendance_records SET Employee_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (clean_new_id, op_id, str(op_id)))
+
+    updated = get_operator(op_id, db_path)
+    return {
+        "success": True,
+        "operator_id": op_id,
+        "operator_name": updated.get("name"),
+        "Employee_id": updated.get("Employee_id"),
+        "employee_code": updated.get("employee_code"),
+        "message": f"Updated Employee_id to {clean_new_id} and cleared employee code for {updated.get('name')}.",
+    }
+
+
+def update_employee_code(
+    operator_name_or_id: str,
+    new_employee_code: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Updates an employee's employee_code to a new numeric code, and clears their Employee_id.
+    """
+    clean_target = str(operator_name_or_id).strip()
+    clean_new_code = str(new_employee_code).strip()
+    if not clean_target:
+        return {"success": False, "error": "Operator name or ID required."}
+    if not clean_new_code:
+        return {"success": False, "error": "New employee code required."}
+    if not re.fullmatch(r"\d+", clean_new_code):
+        return {
+            "success": False,
+            "error": "Employee code must contain only numbers. Please enter the code correctly.",
+        }
+
+    op = get_operator(clean_target, db_path)
+    if not op:
+        op = find_operator_by_name(clean_target, active_only=False, db_path=db_path)
+    if not op:
+        matches = find_operators_matching_name(clean_target, active_only=False, db_path=db_path)
+        if matches:
+            op = matches[0]
+
+    if not op:
+        return {"success": False, "error": f"Operator '{clean_target}' not found."}
+
+    op_id = op["operator_id"]
+    with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        sets = []
+        params = []
+        if "employee_code" in cols:
+            sets.append("employee_code = ?")
+            params.append(clean_new_code)
+        if "Employee_id" in cols:
+            sets.append("Employee_id = NULL")
+        if sets:
+            params.append(op_id)
+            conn.execute(f"UPDATE operators SET {', '.join(sets)} WHERE operator_id = ?", params)
+
+    updated = get_operator(op_id, db_path)
+    return {
+        "success": True,
+        "operator_id": op_id,
+        "operator_name": updated.get("name"),
+        "Employee_id": updated.get("Employee_id"),
+        "employee_code": updated.get("employee_code"),
+        "message": f"Updated employee code to {clean_new_code} for {updated.get('name')}.",
+    }
+
+
+def delete_operator(operator_id: Any, db_path: Optional[str] = None) -> bool:
+    """
+    Deletes an operator by operator_id, employee_code, or numeric id.
+    Also cleans up associated records in shifts, attendance_records, and session_context.
+    """
+    if operator_id is None:
+        return False
+    clean_id = str(operator_id).strip()
+    if not clean_id:
+        return False
+
+    with db.connect(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        has_employee_id = "Employee_id" in cols
+        if has_employee_id:
+            op = conn.execute(
+                """
+                SELECT * FROM operators
+                WHERE operator_id = ?
+                   OR CAST(operator_id AS TEXT) = ?
+                   OR Employee_id = ?
+                   OR employee_code = ?
+                LIMIT 1
+                """,
+                (clean_id, clean_id, clean_id, clean_id),
+            ).fetchone()
+        else:
+            op = conn.execute(
+                """
+                SELECT * FROM operators
+                WHERE operator_id = ?
+                   OR CAST(operator_id AS TEXT) = ?
+                   OR employee_code = ?
+                LIMIT 1
+                """,
+                (clean_id, clean_id, clean_id),
+            ).fetchone()
+
+        if not op:
+            return False
+
+        real_id = op["operator_id"]
+        op_dict = dict(op)
+        emp_code = op_dict.get("Employee_id") or op_dict.get("employee_code")
+        op_name = op_dict.get("name")
+
+        # Delete associated child records first to satisfy foreign key constraints:
+        # 1. Shifts
+        conn.execute(
+            "DELETE FROM shifts WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+            (real_id, str(real_id)),
+        )
+
+        # 2. Shift issues
+        conn.execute(
+            "DELETE FROM shift_issues WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+            (real_id, str(real_id)),
+        )
+
+        # 3. Printing jobs
+        try:
+            conn.execute(
+                "DELETE FROM printing_jobs WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                (real_id, str(real_id)),
+            )
+        except Exception:
+            pass
+
+        # 4. Attendance records
+        try:
+            att_cols = [c[1] for c in conn.execute("PRAGMA table_info(attendance_records)").fetchall()]
+            if att_cols:
+                has_att_emp_id = "Employee_id" in att_cols
+                has_eid = "eid" in att_cols
+                conds = ["operator_id = ?", "CAST(operator_id AS TEXT) = ?", "employee_name = ?"]
+                params = [real_id, str(real_id), op_name]
+                if has_att_emp_id and emp_code:
+                    conds.append("Employee_id = ?")
+                    params.append(emp_code)
+                if has_eid and emp_code:
+                    conds.append("eid = ?")
+                    params.append(emp_code)
+                conn.execute(f"DELETE FROM attendance_records WHERE {' OR '.join(conds)}", params)
+        except Exception:
+            pass
+
+        # 5. Clear session context
+        try:
+            conn.execute(
+                "UPDATE session_context SET current_operator_id = NULL, current_operator_name = NULL WHERE current_operator_id = ? OR CAST(current_operator_id AS TEXT) = ?",
+                (real_id, str(real_id)),
+            )
+        except Exception:
+            pass
+
+        # 6. Delete operator parent record
+        conn.execute(
+            "DELETE FROM operators WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+            (real_id, str(real_id)),
+        )
+
+    # Renumber remaining operators so IDs start from 1 sequentially
+    renumber_operators(db_path)
+
+    log.info("Deleted operator %s (%s) and renumbered operators", real_id, op_name)
+    return True
+
+
+def renumber_operators(db_path: Optional[str] = None) -> None:
+    """
+    Renumbers all operators starting from 1 to N sequentially,
+    updating foreign key references across shifts, shift_issues,
+    printing_jobs, attendance_records, and session_context,
+    and resets sqlite_sequence so new inserts start immediately after N.
+    """
+    with db.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        ops = conn.execute("SELECT * FROM operators ORDER BY operator_id ASC").fetchall()
+        id_map = {}
+        for new_idx, op_row in enumerate(ops, start=1):
+            old_id = op_row["operator_id"]
+            if old_id != new_idx:
+                id_map[old_id] = new_idx
+
+        if id_map:
+            # 1. Map to temporary negative IDs to avoid UNIQUE constraint violations
+            for old_id, new_id in id_map.items():
+                temp_id = -old_id
+                conn.execute("UPDATE operators SET operator_id = ? WHERE operator_id = ?", (temp_id, old_id))
+                conn.execute("UPDATE shifts SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (temp_id, old_id, str(old_id)))
+                conn.execute("UPDATE shift_issues SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (temp_id, old_id, str(old_id)))
+                try:
+                    conn.execute("UPDATE printing_jobs SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (temp_id, old_id, str(old_id)))
+                except Exception:
+                    pass
+                try:
+                    conn.execute("UPDATE attendance_records SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (temp_id, old_id, str(old_id)))
+                except Exception:
+                    pass
+                try:
+                    conn.execute("UPDATE session_context SET current_operator_id = ? WHERE current_operator_id = ? OR CAST(current_operator_id AS TEXT) = ?", (temp_id, old_id, str(old_id)))
+                except Exception:
+                    pass
+
+            # 2. Map from temporary negative IDs to new sequential IDs
+            for old_id, new_id in id_map.items():
+                temp_id = -old_id
+                conn.execute("UPDATE operators SET operator_id = ? WHERE operator_id = ?", (new_id, temp_id))
+                conn.execute("UPDATE shifts SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (new_id, temp_id, str(temp_id)))
+                conn.execute("UPDATE shift_issues SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (new_id, temp_id, str(temp_id)))
+                try:
+                    conn.execute("UPDATE printing_jobs SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (new_id, temp_id, str(temp_id)))
+                except Exception:
+                    pass
+                try:
+                    conn.execute("UPDATE attendance_records SET operator_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?", (new_id, temp_id, str(temp_id)))
+                except Exception:
+                    pass
+                try:
+                    conn.execute("UPDATE session_context SET current_operator_id = ? WHERE current_operator_id = ? OR CAST(current_operator_id AS TEXT) = ?", (new_id, temp_id, str(temp_id)))
+                except Exception:
+                    pass
+
+        # Reset sqlite_sequence to the highest assigned operator_id (or 0 if no operators left)
+        max_row = conn.execute("SELECT MAX(operator_id) AS max_id FROM operators").fetchone()
+        max_id = max_row["max_id"] if max_row and max_row["max_id"] is not None else 0
+        try:
+            conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'operators'", (max_id,))
+        except Exception:
+            pass
+        conn.execute("PRAGMA foreign_keys = ON")
+    log.info("Renumbers operators complete. Highest id: %s", max_id)
 
 
 # ===========================================================================
@@ -652,14 +1109,6 @@ def start_shift(
     attendance_status = "Late" if late_minutes > 0 else "Present"
 
     with db.connect(db_path) as conn:
-        if status in ("active", "Active"):
-            existing = conn.execute(
-                "SELECT shift_id FROM shifts WHERE line_id = ? AND status IN ('active', 'Active') LIMIT 1",
-                (line_id.strip(),),
-            ).fetchone()
-            if existing:
-                raise sqlite3.IntegrityError(f"Line '{line_id}' already has an active shift (ID {existing['shift_id']})")
-
         cur = conn.execute(
             """
             INSERT INTO shifts (
@@ -678,10 +1127,17 @@ def start_shift(
         )
         shift_id = int(cur.lastrowid)
         if status in ("active", "Active"):
-            conn.execute(
-                "UPDATE operators SET current_work_status = 'Working', active_shift_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
-                (shift_id, clean_op_id, str(clean_op_id)),
-            )
+            op_cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+            if "active_shift_id" in op_cols:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Working', active_shift_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (shift_id, clean_op_id, str(clean_op_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Working' WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (clean_op_id, str(clean_op_id)),
+                )
     sync_attendance_start(clean_op_id, ts, s_date, db_path)
     log.info("Started shift %d: line=%s, operator=%s, date=%s, type=%s", shift_id, line_id, clean_op_id, s_date, shift_type)
     return shift_id
@@ -694,7 +1150,7 @@ def get_shift(shift_id: int, db_path: Optional[str] = None) -> Optional[Dict[str
             "SELECT * FROM shifts WHERE shift_id = ?",
             (shift_id,),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def auto_close_ghost_shifts(
@@ -766,8 +1222,7 @@ def auto_close_ghost_shifts(
                     conn.execute(
                         """
                         UPDATE operators SET
-                            current_work_status = 'Off Shift',
-                            active_shift_id = NULL
+                            current_work_status = 'Off Shift'
                         WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?
                         """,
                         (op_id, str(op_id)),
@@ -799,7 +1254,7 @@ def get_active_shift_for_line(
             "SELECT * FROM shifts WHERE line_id = ? AND status IN ('active', 'Active') LIMIT 1",
             (line_id.strip(),),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def get_active_shifts(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -872,7 +1327,7 @@ def get_operators_status(
         line = shift_info.get("line_id") if shift_info else op.get("assigned_line", "line_1")
 
         msg = (
-            f"Yes, {op_name} is currently clocked in and working on {line}."
+            f"Yes, {op_name} is currently clocked in and working."
             if is_working
             else f"No, {op_name} is not working right now. Their current status is {effective_status}."
         )
@@ -902,7 +1357,7 @@ def get_operators_status(
         ]
         all_ops = [
             dict(r) for r in conn.execute(
-                "SELECT operator_id, name, employee_code, role, current_work_status, active_shift_id, assigned_line FROM operators WHERE active = 1 ORDER BY name ASC"
+                "SELECT operator_id, name, employee_code, role, current_work_status FROM operators ORDER BY name ASC"
             ).fetchall()
         ]
 
@@ -976,10 +1431,17 @@ def end_shift(
             params,
         )
         if shift and shift.get("operator_id"):
-            conn.execute(
-                "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
-                (shift["operator_id"], str(shift["operator_id"])),
-            )
+            op_cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+            if "active_shift_id" in op_cols:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (shift["operator_id"], str(shift["operator_id"])),
+                )
+            else:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Off Shift' WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (shift["operator_id"], str(shift["operator_id"])),
+                )
     if shift and shift.get("operator_id"):
         sync_attendance_end(shift["operator_id"], ts, db_path)
     return cur.rowcount > 0
@@ -1004,7 +1466,7 @@ def list_shifts(
         params.append(shift_type.strip())
     if operator_id:
         clauses.append("operator_id = ?")
-        params.append(operator_id.strip())
+        params.append(str(operator_id).strip())
     if status:
         clauses.append("status = ?")
         params.append(status.strip())
@@ -1015,7 +1477,11 @@ def list_shifts(
 
     with db.connect(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    res = []
+    for r in rows:
+        d = dict(r)
+        res.append(d)
+    return res
 
 
 # ===========================================================================
@@ -1087,7 +1553,7 @@ def get_production_record(production_id: int, db_path: Optional[str] = None) -> 
             "SELECT * FROM production_records WHERE production_id = ?",
             (production_id,),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def update_production_record(
@@ -1162,16 +1628,21 @@ def get_operator_production(
     Returns actual stored production only, including wall, status, timestamps, job info.
     Preserves closed-shift history queryability.
     """
-    clean_op = operator_id.strip() if operator_id else ""
+    clean_op = str(operator_id).strip() if operator_id else ""
     if not clean_op:
         return []
+    op_rec = get_operator(clean_op, db_path)
+    op_ids = [clean_op]
+    if op_rec:
+        op_ids.append(str(op_rec.get("operator_id")))
+    placeholders = ", ".join(["?"] * len(op_ids))
     query = (
         "SELECT pr.*, s.operator_id, s.shift_date, s.shift_type, s.line_id, s.status AS shift_status "
         "FROM production_records pr "
         "JOIN shifts s ON pr.shift_id = s.shift_id "
-        "WHERE s.operator_id = ?"
+        f"WHERE (s.operator_id IN ({placeholders}) OR CAST(s.operator_id AS TEXT) IN ({placeholders}))"
     )
-    params: List[Any] = [clean_op]
+    params: List[Any] = op_ids + op_ids
     if shift_id is not None:
         query += " AND pr.shift_id = ?"
         params.append(shift_id)
@@ -1181,7 +1652,11 @@ def get_operator_production(
     query += " ORDER BY pr.start_time ASC, pr.wall_number ASC"
     with db.connect(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    res = []
+    for r in rows:
+        d = dict(r)
+        res.append(d)
+    return res
 
 
 # ===========================================================================
@@ -1300,7 +1775,7 @@ def get_issue(issue_id: int, db_path: Optional[str] = None) -> Optional[Dict[str
             "SELECT * FROM shift_issues WHERE issue_id = ?",
             (issue_id,),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def update_issue(
@@ -1418,7 +1893,7 @@ def get_machine(machine_id_or_name: Union[int, str], db_path: Optional[str] = No
             row = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (int(machine_id_or_name),)).fetchone()
         else:
             row = conn.execute("SELECT * FROM machines WHERE machine_name = ?", (str(machine_id_or_name).strip(),)).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def list_machines(status: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1584,7 +2059,7 @@ def get_printing_job(job_id: int, db_path: Optional[str] = None) -> Optional[Dic
     """Retrieves a printing job by job_id."""
     with db.connect(db_path) as conn:
         row = conn.execute("SELECT * FROM printing_jobs WHERE job_id = ?", (job_id,)).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def list_printing_jobs(
@@ -2067,8 +2542,14 @@ def list_shift_issues(
             "FROM shift_issues i JOIN shifts s ON i.shift_id = s.shift_id"
         )
         if operator_id is not None:
-            clauses.append("s.operator_id = ?")
-            params.append(operator_id.strip())
+            clean_op = str(operator_id).strip()
+            op_rec = get_operator(clean_op, db_path)
+            op_ids = [clean_op]
+            if op_rec:
+                op_ids.append(str(op_rec.get("operator_id")))
+            p_holders = ", ".join(["?"] * len(op_ids))
+            clauses.append(f"(s.operator_id IN ({p_holders}) OR CAST(s.operator_id AS TEXT) IN ({p_holders}))")
+            params.extend(op_ids + op_ids)
         if shift_date is not None:
             clauses.append("s.shift_date = ?")
             params.append(shift_date.strip())
@@ -2146,7 +2627,7 @@ def get_handover(handover_id: int, db_path: Optional[str] = None) -> Optional[Di
             "SELECT * FROM handovers WHERE handover_id = ?",
             (handover_id,),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def get_pending_handover_for_line(line_id: str = "line_1", db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -2160,7 +2641,7 @@ def get_pending_handover_for_line(line_id: str = "line_1", db_path: Optional[str
             """,
             (line_id.strip(),),
         ).fetchone()
-    return _row_to_dict(row)
+    return _row_to_dict(row, db_path)
 
 
 def complete_handover(
@@ -2308,28 +2789,59 @@ def create_or_update_employee(
     name: str,
     role: str = "Operator",
     status: str = "Active",
+    Employee_id: Optional[str] = None,
+    employee_code: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Inserts or updates an employee in operators table."""
+    """Inserts or updates an employee in operators table with distinct Employee_id and employee_code."""
     clean_name = str(name).strip() if name else ""
     if not clean_name:
         return {"success": False, "error": "Employee name cannot be empty."}
+
+    clean_eid = str(Employee_id).strip().upper() if (Employee_id is not None and str(Employee_id).strip()) else None
+    clean_code = str(employee_code).strip() if (employee_code is not None and str(employee_code).strip()) else None
+
+    if clean_eid and not re.fullmatch(r"K6K\d+", clean_eid):
+        return {
+            "success": False,
+            "error": f"Invalid Employee ID '{clean_eid}'. Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format.",
+        }
+    if clean_code and not re.fullmatch(r"\d+", clean_code):
+        return {
+            "success": False,
+            "error": "Employee code must contain only numbers. Please enter the code correctly.",
+        }
+
+    # Invariant: whenever an Employee_id is provided, employee_code MUST be blank.
+    if clean_eid:
+        clean_code = None
 
     existing = find_operator_by_name(clean_name, active_only=False, db_path=db_path)
     if existing:
         op_id = existing["operator_id"]
         act_val = 1 if status.lower() == "active" else 0
-        update_operator(op_id, role=role, active=act_val, db_path=db_path)
+        update_operator(
+            op_id,
+            role=role,
+            active=act_val,
+            Employee_id=clean_eid,
+            employee_code=clean_code,
+            clear_employee_code=bool(clean_eid and not clean_code),
+            db_path=db_path,
+        )
         with db.connect(db_path) as conn:
-            conn.execute("UPDATE operators SET status = ? WHERE operator_id = ?", (status, op_id))
+            if "status" in [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]:
+                conn.execute("UPDATE operators SET status = ? WHERE operator_id = ?", (status, op_id))
         updated = get_operator(op_id, db_path)
         return {"success": True, "action": "updated", "operator": updated}
     else:
-        code = f"EMP_{clean_name.upper().replace(' ', '_')}"
+        serial_id = get_next_operator_id(db_path=db_path)
         op_id = create_operator(
+            operator_id=serial_id,
             name=clean_name,
             role=role,
-            employee_code=code,
+            Employee_id=clean_eid,
+            employee_code=clean_code,
             status=status,
             active=1 if status.lower() == "active" else 0,
             db_path=db_path,
@@ -2366,9 +2878,13 @@ def start_employee_shift(
 
     op = matches[0] if matches else find_operator_by_name(clean_name, active_only=False, db_path=db_path)
     if not op:
+        msg = f"I couldn't find {clean_name} in our employee list. Please enter or provide your Employee_id."
         return {
             "success": False,
-            "error": f"Operator '{clean_name}' does not exist in the database. Please confirm if you would like me to register them as a new employee first.",
+            "status": "unknown_operator",
+            "error": msg,
+            "message": msg,
+            "requires_employee_id": True,
             "requires_registration": True,
             "operator_name": clean_name,
         }
@@ -2414,16 +2930,6 @@ def start_employee_shift(
     else:
         s_type = shift_type
 
-    # Close any lingering shift on this line from another operator
-    line_row = None
-    with db.connect(db_path) as conn:
-        line_row = conn.execute(
-            "SELECT shift_id, operator_id FROM shifts WHERE line_id = ? AND status IN ('active', 'Active')",
-            (line_id,),
-        ).fetchone()
-    if line_row and str(line_row["operator_id"]) != str(op_id):
-        end_shift(line_row["shift_id"], status="Completed", db_path=db_path)
-
     try:
         s_id = start_shift(
             operator_id=op_id,
@@ -2434,10 +2940,17 @@ def start_employee_shift(
             db_path=db_path,
         )
         with db.connect(db_path) as conn:
-            conn.execute(
-                "UPDATE operators SET current_work_status = 'Working', active_shift_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
-                (s_id, op_id, str(op_id)),
-            )
+            op_cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+            if "active_shift_id" in op_cols:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Working', active_shift_id = ? WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (s_id, op_id, str(op_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE operators SET current_work_status = 'Working' WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                    (op_id, str(op_id)),
+                )
             conn.execute(
                 "UPDATE shifts SET current_status = 'Working', operator_name = ?, regular_hours = 0.0, standard_hours = 9.0 WHERE shift_id = ?",
                 (op_name, s_id),
@@ -2451,7 +2964,7 @@ def start_employee_shift(
             "line_id": line_id,
             "status": "Active",
             "current_status": "Working",
-            "message": f"Shift started for {op_name} on {line_id} ({s_type} shift).",
+            "message": f"Shift started for {op_name} ({s_type} shift).",
         }
     except Exception as exc:
         log.error("start_employee_shift failed: %s", exc)
@@ -2489,15 +3002,22 @@ def end_employee_shift(
                 (op["operator_id"], str(op["operator_id"])),
             ).fetchone()
 
-        if curr_status == "Off Shift" or (active_shift_id is None and not row):
+        if (curr_status == "Off Shift" and not row) or (not row and active_shift_id is None):
             return {"success": False, "error": f"Cannot end shift: Operator {op_name} is already Off Shift."}
 
         if not row:
             with db.connect(db_path) as conn:
-                conn.execute(
-                    "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
-                    (op["operator_id"], str(op["operator_id"])),
-                )
+                op_cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+                if "active_shift_id" in op_cols:
+                    conn.execute(
+                        "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                        (op["operator_id"], str(op["operator_id"])),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE operators SET current_work_status = 'Off Shift' WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                        (op["operator_id"], str(op["operator_id"])),
+                    )
             return {"success": True, "message": f"Operator {op_name} is now Off Shift.", "status": "Completed"}
     else:
         with db.connect(db_path) as conn:
@@ -2520,10 +3040,17 @@ def end_employee_shift(
     name = op_rec["name"] if op_rec else str(row["operator_id"])
 
     with db.connect(db_path) as conn:
-        conn.execute(
-            "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
-            (row["operator_id"], str(row["operator_id"])),
-        )
+        op_cols = [c[1] for c in conn.execute("PRAGMA table_info(operators)").fetchall()]
+        if "active_shift_id" in op_cols:
+            conn.execute(
+                "UPDATE operators SET current_work_status = 'Off Shift', active_shift_id = NULL WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                (row["operator_id"], str(row["operator_id"])),
+            )
+        else:
+            conn.execute(
+                "UPDATE operators SET current_work_status = 'Off Shift' WHERE operator_id = ? OR CAST(operator_id AS TEXT) = ?",
+                (row["operator_id"], str(row["operator_id"])),
+            )
         conn.execute(
             "UPDATE shifts SET current_status = 'Completed' WHERE shift_id = ?",
             (s_id,),
@@ -2607,7 +3134,7 @@ def update_employee_work_status(
             (op_id, str(op_id)),
         ).fetchone()
 
-    has_active_shift = (active_shift_id is not None) or (active_shift_row is not None)
+    has_active_shift = (active_shift_row is not None) or (active_shift_id is not None) or (curr_status in ("Working", "On Break"))
 
     # State Precondition Checks:
     if target_status == "On Break":

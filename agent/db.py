@@ -85,16 +85,13 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON machine_events(timestamp DESC);
 
 -- 1. Operators
 CREATE TABLE IF NOT EXISTS operators (
-    operator_id   INT PRIMARY KEY,
+    operator_id   INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    Employee_id   TEXT UNIQUE,
     role          TEXT NOT NULL DEFAULT 'Operator',
-    status        TEXT NOT NULL DEFAULT 'Active',
     employee_code TEXT UNIQUE,
-    active        INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
-    current_work_status TEXT NOT NULL DEFAULT 'Off Shift',
-    active_shift_id     INTEGER,
-    assigned_line       TEXT NOT NULL DEFAULT 'line_1'
+    current_work_status TEXT NOT NULL DEFAULT 'Off Shift'
 );
 
 -- 2. Shifts (Attendance & Shift Lifecycle)
@@ -126,7 +123,7 @@ CREATE TABLE IF NOT EXISTS shifts (
     operator_name      TEXT,
     employee_code      TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_shifts_single_active_line ON shifts(line_id) WHERE status IN ('active', 'Active');
+CREATE INDEX IF NOT EXISTS idx_shifts_line ON shifts(line_id);
 CREATE INDEX IF NOT EXISTS idx_shifts_date ON shifts(shift_date, shift_type);
 CREATE INDEX IF NOT EXISTS idx_shifts_operator ON shifts(operator_id, start_time DESC);
 
@@ -295,10 +292,8 @@ _MIGRATIONS = [
     ("print_jobs", "wall_height_mm", "REAL"),
     ("print_jobs", "wall_width_mm", "REAL"),
     ("print_jobs", "layer_height_mm", "REAL"),
-    ("operators", "status", "TEXT NOT NULL DEFAULT 'Active'"),
+    ("operators", "Employee_id", "TEXT"),
     ("operators", "current_work_status", "TEXT NOT NULL DEFAULT 'Off Shift'"),
-    ("operators", "active_shift_id", "INTEGER"),
-    ("operators", "assigned_line", "TEXT DEFAULT 'line_1'"),
     ("shifts", "day", "TEXT DEFAULT 'Thursday'"),
     ("shifts", "planned_start_time", "DATETIME DEFAULT '2026-10-08 08:00:00'"),
     ("shifts", "planned_end_time", "DATETIME DEFAULT '2026-10-08 17:00:00'"),
@@ -372,7 +367,8 @@ def _migrate_shifts_table_if_needed(conn) -> None:
             conn.execute(f"INSERT INTO shifts_migrated ({cols_str}) SELECT {cols_str} FROM shifts")
             conn.execute("DROP TABLE shifts")
             conn.execute("ALTER TABLE shifts_migrated RENAME TO shifts")
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shifts_single_active_line ON shifts(line_id) WHERE status IN ('active', 'Active')")
+            conn.execute("DROP INDEX IF EXISTS idx_shifts_single_active_line")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_shifts_line ON shifts(line_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shifts_date ON shifts(shift_date, shift_type)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_shifts_operator ON shifts(operator_id, start_time DESC)")
             conn.execute("PRAGMA foreign_keys=ON")

@@ -142,6 +142,15 @@ SYSTEM_PROMPT = (
     "8. EMPLOYEE STATUS, BREAKS & SHIFT PRECONDITION VALIDATION:\n"
     "   - Always use `update_employee_work_status` to assign or change an employee's live work status ('Working', 'On Break', 'Off Shift', 'On Leave'), including lunch breaks, tea breaks, or resuming work. NEVER perform blind SQL writes via `execute_sql_write` to change operator status.\n"
     "   - Always use `start_employee_shift` to start an employee's shift and `end_employee_shift` to end their shift.\n"
+    "   - OPERATOR IDENTIFICATION & REGISTRATION FLOW:\n"
+    "     * Before starting or ending a shift and before updating details, the system must obtain the user's name, employee ID, or employee code. Multiple persons can work simultaneously. If a user says 'start my shift' or 'end my shift' or 'update my employee id/code' without specifying their name, employee ID, or employee code, NEVER assume or pick an operator; prompt them: 'Please enter or provide your name, employee ID, or employee code to start your shift.' (or 'Please enter or provide your name, employee ID, or employee code to end your shift.' / 'Please enter or provide your name, employee ID, or employee code to update your details.').\n"
+    "     * If an operator provides their employee ID, look them up by Employee_id. If an operator provides their employee code (e.g. 4-digit code), look them up by employee_code.\n"
+    "     * When the user gives a name not found in the employee list, NEVER auto-generate an ID. Ask: 'I couldn't find <name> in our employee list. Please enter or provide your Employee_id.'\n"
+    "     * If the user says they don't have an Employee_id (or say 'no' / 'don't have one'), ask: 'Please provide the last 4 digits of your mobile number to use as your employee code.'\n"
+    "     * When a user provides an employee code (e.g. 4-digit mobile suffix), it MUST be stored only in employee_code and Employee_id must be left blank.\n"
+    "     * When a user provides an Employee_id, it MUST be stored only in Employee_id and employee_code must be left blank.\n"
+    "     * If a user has neither an Employee_id nor an employee code, both fields must be left blank.\n"
+    "     * When an employee gets a new Employee_id and asks to update it, call update_employee_id(operator_name_or_id=<name>, new_employee_id=<id>) which sets Employee_id and clears employee_code.\n"
     "   - CRITICAL PRECONDITION VALIDATION: Employees cannot be put on break if they are not currently working on an active shift! If an employee is currently Off Shift or has no active shift (`active_shift_id IS NULL`), `update_employee_work_status` will return a structured failure response (`{\"success\": False, \"error\": \"Cannot update status to On Break: Operator Hamdaan is currently Off Shift. Please start their shift first.\"}`).\n"
     "   - When a tool returns this failure response, you MUST read the error and naturally tell the user in clear spoken English: \"I cannot put Hamdaan on a lunch break because his shift has already ended / he is off-shift.\" (or \"I cannot put Hamdaan on a lunch break because he is currently off-shift. Please start his shift first.\"). Never ignore tool failure responses or claim the break succeeded!\n"
     "   - PREVENT DOUBLE ACTIONS & IDEMPOTENT CLOCK-IN: Do not start a shift if the operator is already Working; if an operator is already clocked into an active shift, `start_employee_shift` returns `{\"success\": False, \"error\": \"Operator <name> is already clocked into an active shift.\"}`. Inform the user naturally (e.g., 'Operator Hamdaan is already clocked into an active shift.'). Do not end a shift if the operator is already Off Shift.\n"
@@ -169,9 +178,14 @@ def list_or_search_employees(name_query: str = "") -> list:
     return shift_store.list_or_search_employees(name_query or None)
 
 
-def create_or_update_employee(name: str, role: str = "Operator", status: str = "Active") -> dict:
-    """Register a new employee/operator or update their role or status in the database."""
-    return shift_store.create_or_update_employee(name, role, status)
+def create_or_update_employee(name: str, role: str = "Operator", status: str = "Active", Employee_id: str = "", employee_code: str = "") -> dict:
+    """Register a new employee/operator or update their role or status in the database. If user gives an employee code, pass employee_code; if user gives Employee_id, pass Employee_id."""
+    return shift_store.create_or_update_employee(name, role, status, Employee_id=Employee_id or None, employee_code=employee_code or None)
+
+
+def update_employee_id(operator_name_or_id: str, new_employee_id: str) -> dict:
+    """Updates an employee's Employee_id to a new ID, and clears their employee_code."""
+    return shift_store.update_employee_id(operator_name_or_id, new_employee_id)
 
 
 def start_employee_shift(operator_name: str, shift_type: str = "", actual_start_time: str = "") -> dict:
@@ -225,7 +239,6 @@ def record_operator_wall_production(
     notes: str = "",
 ) -> dict:
     """Record completed wall production for an operator. Use when an operator reports completing wall(s) (e.g. 'Hamdan completed printing 2 walls', 'I printed to walls', 'Recorded 2 walls for Hamdan'). Handles numbers and STT homophones like 'to walls' = 2 walls."""
-    from agent import identity
     name_to_use = (operator_name or "").strip() or "Operator"
     if operator_name and operator_name.strip():
         matches = shift_store.find_operators_matching_name(operator_name.strip(), active_only=True)
@@ -320,7 +333,6 @@ def query_operator_wall_production(operator_name: str = "") -> dict:
         return {"found": False, "message": "No operator name provided to query wall production."}
     op = shift_store.find_operator_by_name(name_to_use)
     if not op:
-        from agent import identity
         res = identity.resolve_employee(name_to_use, active_only=False)
         if res.status == "MATCHED" and res.operator:
             op = res.operator
@@ -495,7 +507,7 @@ def get_active_shift() -> dict:
     """Get the active shift and operator currently running on the line."""
     active = shift_store.get_active_shift_for_line("line_1")
     if not active:
-        return {"available": True, "active": False, "reason": "No active shift is currently running on Line 1."}
+        return {"available": True, "active": False, "reason": "No active shift is currently running."}
     op = shift_store.get_operator(active["operator_id"])
     return {
         "available": True,
@@ -526,6 +538,7 @@ TOOLS: List[Callable] = [
     learn_and_store_in_rag_brain,
     list_or_search_employees,
     create_or_update_employee,
+    update_employee_id,
     start_employee_shift,
     end_employee_shift,
     update_employee_work_status,
@@ -647,6 +660,9 @@ class SessionContext:
     awaiting_problem_details: bool = False
     pending_problem_info: Optional[Dict[str, Any]] = None
     awaiting_action_for_issue: bool = False
+    awaiting_shift_name: Optional[Dict[str, Any]] = None
+    awaiting_employee_id: Optional[Dict[str, Any]] = None
+    awaiting_mobile_digits: Optional[Dict[str, Any]] = None
     last_updated_at: float = field(default_factory=time.time)
     current_operator_id: Optional[str] = None
     current_operator_name: Optional[str] = None
@@ -1273,21 +1289,20 @@ class Assistant:
             # browser and never from a fixed string.
             now = datetime.datetime.fromtimestamp(self._server_now())
             name = params.get("operator_name") or "Operator"
-            line_label = _spoken_line(line_id)
             if params.get("create_operator"):
+                next_code = shift_store.get_next_operator_code()
                 return (
-                    f"{name}, today is {_spoken_date(now)} and the current time is "
-                    f"{_spoken_time(now)}. I could not find an operator named {name}. "
-                    f"Shall I register you and start your shift on {line_label}?"
+                    f"I couldn't find {name} in our employee list. "
+                    f"Would you like me to register them as {next_code} and start their shift?"
                 )
             return (
                 f"{name}, today is {_spoken_date(now)} and the current time is "
-                f"{_spoken_time(now)}. Shall I start your shift on {line_label}?"
+                f"{_spoken_time(now)}. Shall I start your shift?"
             )
         if intent_val == "SHIFT_END":
             active = shift_store.get_active_shift_for_line(line_id)
             if not active:
-                return f"You are about to end the active shift on {line_id}. Please confirm to proceed."
+                return "You are about to end your active shift. Please confirm to proceed."
             op = shift_store.get_operator(active["operator_id"])
             name = op["name"] if op else active["operator_id"]
             shift_date = active["shift_date"]
@@ -1295,7 +1310,6 @@ class Assistant:
             now_ts = self._server_now()
             st_str = _spoken_time(datetime.datetime.fromtimestamp(st)) if st else "unknown time"
             et_str = _spoken_time(datetime.datetime.fromtimestamp(now_ts))
-            line_label = _spoken_line(line_id)
 
             prod = shift_store.get_shift_production(active["shift_id"])
             completed_walls = [r for r in prod if r.get("status") == "completed"]
@@ -1318,17 +1332,18 @@ class Assistant:
             return (
                 f"{name}, on your {shift_date} shift starting at {st_str}, "
                 f"current time is {et_str}. You completed {wall_str} with {issue_str}. "
-                f"Shall I end your shift on {line_label}?"
+                f"Shall I end your shift?"
             )
         if intent_val == "REGISTER_EMPLOYEE":
             name = params.get("operator_name") or "Operator"
-            return f"I could not find an employee named {name}. Shall I register {name} as a new operator?"
+            next_code = shift_store.get_next_operator_code()
+            return f"I couldn't find {name} in our employee list. Would you like me to register them as {next_code} and start their shift?"
         if intent_val == "LOG_WALL_PRODUCTION":
             wn = params.get("wall_number")
             st = params.get("status", "completed")
             op_name = params.get("operator_name")
             name_prefix = f"{op_name}, " if op_name else ""
-            return f"{name_prefix}You are about to log Wall {wn} as {st} on {line_id}. Please confirm to proceed."
+            return f"{name_prefix}You are about to log Wall {wn} as {st}. Please confirm to proceed."
         if intent_val == "LOG_SHIFT_ISSUE":
             dt = params.get("downtime_minutes", 0)
             dt_str = f" with {dt:.0f} minutes downtime" if dt else ""
@@ -1384,18 +1399,13 @@ class Assistant:
 
         if action.intent == "REGISTER_EMPLOYEE":
             op_name = action.params.get("operator_name", "Operator")
-            clean_code = re.sub(r"[^A-Za-z0-9]", "", op_name).upper()
-            new_op_id = f"OP_{clean_code}"
-            if shift_store.get_operator(new_op_id):
-                idx = 1
-                while shift_store.get_operator(f"{new_op_id}_{idx}"):
-                    idx += 1
-                new_op_id = f"{new_op_id}_{idx}"
+            new_op_id = shift_store.get_next_operator_code()
             try:
                 shift_store.create_operator(
                     operator_id=new_op_id,
+                    employee_code=new_op_id,
                     name=op_name,
-                    role="operator",
+                    role="Operator",
                     active=1,
                 )
                 # Verify DB write
@@ -1417,9 +1427,6 @@ class Assistant:
             shift_type = action.params.get("shift_type", "Morning")
             operator_id = action.params.get("operator_id")
             target_walls = action.params.get("target_walls", 0)
-            existing = shift_store.get_active_shift_for_line(line_id)
-            if existing:
-                return "Line 1 already has an active shift. Please close the current shift first."
 
             if operator_id and not action.params.get("create_operator"):
                 op_rec = shift_store.get_operator(operator_id)
@@ -1429,17 +1436,12 @@ class Assistant:
 
             if action.params.get("create_operator"):
                 op_name = action.params.get("operator_name", "Operator")
-                clean_code = re.sub(r"[^A-Za-z0-9]", "", op_name).upper()
-                new_op_id = f"OP_{clean_code}"
-                if shift_store.get_operator(new_op_id):
-                    idx = 1
-                    while shift_store.get_operator(f"{new_op_id}_{idx}"):
-                        idx += 1
-                    new_op_id = f"{new_op_id}_{idx}"
+                new_op_id = shift_store.get_next_operator_code()
                 shift_store.create_operator(
                     operator_id=new_op_id,
+                    employee_code=new_op_id,
                     name=op_name,
-                    role="operator",
+                    role="Operator",
                     active=1,
                 )
                 operator_id = new_op_id
@@ -1473,11 +1475,11 @@ class Assistant:
                 )
                 if action.params.get("create_operator"):
                     return (
-                        f"I have added {name} as a new operator and started their {shift_type} shift on {_spoken_line(line_id)}. "
+                        f"I have added {name} as a new operator and started their {shift_type} shift. "
                         f"{name}, your {shift_type} shift has started at {_spoken_time(moment)}."
                     )
                 return (
-                    f"{name}, your {shift_type} shift on {_spoken_line(line_id)} "
+                    f"{name}, your {shift_type} shift "
                     f"has started at {_spoken_time(moment)}."
                 )
             except Exception as exc:
@@ -1485,9 +1487,19 @@ class Assistant:
                 return f"Failed to start shift: {exc}"
 
         if action.intent == "SHIFT_END":
-            active = shift_store.get_active_shift_for_line(line_id)
+            # Find active shift for the specified operator if provided, else on line
+            active = None
+            if action.params.get("operator_id"):
+                op_id_p = action.params["operator_id"]
+                shifts = shift_store.list_shifts(status="Active")
+                for s in shifts:
+                    if str(s.get("operator_id")) == str(op_id_p):
+                        active = s
+                        break
             if not active:
-                return f"No active shift found to end on {line_id}."
+                active = shift_store.get_active_shift_for_line(line_id)
+            if not active:
+                return "No active shift found to end."
             op_rec = shift_store.get_operator(active["operator_id"]) if active else None
             if op_rec and op_rec.get("current_work_status") == "Off Shift":
                 name = op_rec.get("name") or active["operator_id"]
@@ -1506,7 +1518,7 @@ class Assistant:
                 name = op["name"] if op else active["operator_id"]
                 self._session_ctx.clear(action.session_id, line_id)
                 dur_str = f" Duration: {dur_formatted}." if dur_formatted else ""
-                return f"{name}, your shift on {_spoken_line(line_id)} has ended.{dur_str}"
+                return f"{name}, your shift has ended.{dur_str}"
             except Exception as exc:
                 log.error("Failed to end shift: %s", exc)
                 return f"Failed to end shift: {exc}"
@@ -1673,6 +1685,147 @@ class Assistant:
 
         return "Unknown action."
 
+    @staticmethod
+    def _detect_shift_request_lacking_name(question: str, operator_id: Optional[str] = None) -> Optional[str]:
+        """
+        If a user asks to start or end a shift without specifying their name, Employee ID, or Employee Code,
+        we must never guess or default to whoever is in the attendance table.
+        Prompt for their name, employee ID, or employee code immediately.
+        """
+        if operator_id:
+            return None
+        clean = (question or "").lower().strip()
+        if not clean:
+            return None
+
+        # Exclude questions inquiring about status, metrics, or who is working
+        if any(w in clean for w in ["who", "which", "what", "kaun", "kisne", "kitne", "how", "status", "kya", "running", "detail", "summary"]):
+            return None
+
+        is_start = bool(re.search(r"\b(start|begin|commence|shuru|clock\s*in|punch\s*in)\b.*\b(shift|work|duty|kaam)?\b|\b(shift|work|duty|kaam)\b.*\b(start|begin|commence|shuru)\b|\b(clock\s*in|punch\s*in)\b", clean))
+        is_end = bool(re.search(r"\b(end|close|stop|finish|khatam|band|clock\s*out|punch\s*out)\b.*\b(shift|work|duty|kaam)?\b|\b(shift|work|duty|kaam)\b.*\b(end|close|stop|finish|khatam|band)\b|\b(clock\s*out|punch\s*out)\b", clean))
+
+        if not is_start and not is_end:
+            return None
+
+        from agent import identity, query_router as qr
+        extracted = identity.extract_name_candidate(question) or qr.extract_operator_name(question)
+        if not extracted:
+            cands = shift_store.name_slot_candidates(question)
+            if cands:
+                extracted = cands[0]
+        if not extracted:
+            ops = shift_store.list_operators(active_only=False)
+            for o in ops:
+                oname = (o.get("name") or "").lower()
+                fname = oname.split()[0] if oname else ""
+                eid = (o.get("Employee_id") or "").lower()
+                code = (o.get("employee_code") or "").lower()
+                op_id = str(o.get("operator_id") or "").lower()
+                if oname and re.search(r"\b" + re.escape(oname) + r"\b", clean):
+                    extracted = o["name"]
+                    break
+                if fname and len(fname) >= 3 and re.search(r"\b" + re.escape(fname) + r"\b", clean):
+                    extracted = o["name"]
+                    break
+                if eid and re.search(r"\b" + re.escape(eid) + r"\b", clean):
+                    extracted = o["name"]
+                    break
+                if code and re.search(r"\b" + re.escape(code) + r"\b", clean):
+                    extracted = o["name"]
+                    break
+                if op_id and re.search(r"\b" + re.escape(op_id) + r"\b", clean):
+                    extracted = o["name"]
+                    break
+            if not extracted:
+                for alias, canon in getattr(shift_store, "_OPERATOR_ALIASES", {}).items():
+                    if re.search(r"\b" + re.escape(alias) + r"\b", clean):
+                        extracted = canon
+                        break
+
+        if not extracted:
+            if is_start:
+                return "Please enter or provide your name, employee ID, or employee code to start your shift."
+            if is_end:
+                return "Please enter or provide your name, employee ID, or employee code to end your shift."
+        return None
+
+    @staticmethod
+    def _clean_spoken_name(text: str) -> str:
+        clean = re.sub(r"^(my\s+name\s+is|i\s+am|i'm|this\s+is|mera\s+naam|main\s+hoon|mai\s+hu)\s+", "", text.strip(), flags=re.IGNORECASE)
+        clean = re.sub(r"\s+(here|speaking|bol\s+raha\s+hoon|bol\s+rahi\s+hoon|bol\s+raha\s+hu)$", "", clean, flags=re.IGNORECASE)
+        return clean.strip(" .,!?")
+
+    @staticmethod
+    def _is_no_employee_id(text: str) -> bool:
+        clean = text.lower().strip()
+        words = set(re.findall(r"\b\w+\b", clean))
+        if words & {"no", "nahi", "none", "dont", "na", "nope"}:
+            return True
+        if any(p in clean for p in ["dont have", "don't have", "do not have", "nahi hai", "no employee id", "no id"]):
+            return True
+        return False
+
+    @staticmethod
+    def normalize_spoken_identifier(text: str) -> str:
+        """
+        Normalizes spoken employee IDs or codes that may come from speech-to-text.
+        e.g., 'K6 K 006', 'K6, K006.', 'A6 ke 006', 'K-6, K-0, 0, 6.', 'k six k zero zero six' -> 'K6K006'.
+        """
+        if not text:
+            return text
+        digit_map = {
+            "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3",
+            "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+        }
+        s = text.strip()
+        s_lower = s.lower()
+        for word, digit in digit_map.items():
+            s_lower = re.sub(r"\b" + word + r"\b", digit, s_lower)
+
+        # Common STT mistranscriptions of K6K: 'a6 ke', 'a6 k', 'k-6, k-0', 'k6 k', 'k six k'
+        s_lower = re.sub(r"\ba\s*6\s*k(?:e|ey)?\b", "k6k", s_lower)
+        s_lower = re.sub(r"\bk\s*six\s*k\b", "k6k", s_lower)
+
+        cleaned = re.sub(r"[,.\-_]", " ", s_lower)
+        joined = "".join(cleaned.split())
+        m_joined = re.search(r"k6k(\d+)", joined)
+        if m_joined:
+            remaining = re.sub(
+                r"\b(my|name|is|i|am|employee|emp|id|code|number|this|mera|naam|it|its|here|speaking|please)\b",
+                "",
+                cleaned,
+            )
+            remaining_joined = "".join(remaining.split())
+            if re.fullmatch(r"k6k\d+", remaining_joined):
+                return f"K6K{m_joined.group(1)}"
+            m_span = re.search(r"\b(?:k\s*6\s*k|k6k)\s*([0-9\s]+)\b", cleaned)
+            if m_span:
+                digits = re.sub(r"\s+", "", m_span.group(1))
+                return re.sub(
+                    r"(?i)\b(?:a\s*6\s*k(?:e|ey)?|k\s*[-–—,\.]*\s*6\s*[-–—,\.]*\s*k(?:e|ey)?|k\s*six\s*k|k6k)\s*([0-9\s,\.\-_]+)\b",
+                    f"K6K{digits}",
+                    text,
+                ).strip().rstrip(".,!?")
+
+        return text.strip().rstrip(".,!?")
+
+    @staticmethod
+    def _extract_employee_id_candidate(text: str) -> Optional[str]:
+        clean = Assistant.normalize_spoken_identifier(text.strip())
+        m = re.search(r"(?:employee\s*id|emp\s*id|id)\s*(?:is|:)?\s*([A-Za-z0-9_-]+)", clean, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        tokens = [
+            w for w in re.findall(r"\b[A-Za-z0-9_-]+\b", clean)
+            if w.lower() not in {
+                "my", "is", "the", "id", "employee", "code", "number", "it", "its",
+                "start", "end", "shift", "work", "duty", "please", "hello", "hi",
+                "update", "change", "replace", "set", "for", "to", "with", "as"
+            }
+        ]
+        return tokens[0] if tokens else None
+
     # --- public ---
 
     def ask(
@@ -1704,7 +1857,17 @@ class Assistant:
             or sess.awaiting_outcome
             or sess.awaiting_problem_details
             or sess.awaiting_action_for_issue
+            or sess.awaiting_shift_name
+            or sess.awaiting_employee_id
+            or sess.awaiting_mobile_digits
         )
+
+        if not pending and not has_awaiting_state:
+            prompt_for_name = self._detect_shift_request_lacking_name(question, operator_id=operator_id)
+            if prompt_for_name:
+                intent_type = "SHIFT_END" if "end" in prompt_for_name.lower() else "SHIFT_START"
+                self._session_ctx.update(session_id, line_id, awaiting_shift_name={"intent": intent_type, "line_id": line_id})
+                return prompt_for_name
 
         # 1. Primary autonomous Gemini Agentic Brain
         # When GEMINI_API_KEY is configured (self.use_llm is True) and there is no pending confirmation,
@@ -2172,6 +2335,410 @@ class Assistant:
             self._actions.set(session_id, line_id, "LOG_SHIFT_ISSUE", params, prompt)
             return prompt
 
+        # 1.45 Check awaiting_shift_name
+        if sess.awaiting_shift_name:
+            clean_q = query_router.strip_wake_words(question).strip()
+            q_lower = clean_q.lower()
+            words = set(re.findall(r"\b\w+\b", q_lower))
+            cancel_terms = {"cancel", "stop", "roko"}
+            if (words & cancel_terms) or "mat karo" in q_lower:
+                self._session_ctx.update(session_id, line_id, awaiting_shift_name=None)
+                return "Action cancelled. No changes were made."
+
+            prompt_for_name = self._detect_shift_request_lacking_name(clean_q, operator_id=operator_id)
+            if prompt_for_name:
+                intent_type = "SHIFT_END" if "end" in prompt_for_name.lower() else "SHIFT_START"
+                self._session_ctx.update(session_id, line_id, awaiting_shift_name={"intent": intent_type, "line_id": line_id})
+                return prompt_for_name
+
+            intent_info = sess.awaiting_shift_name
+            self._session_ctx.update(session_id, line_id, awaiting_shift_name=None)
+            intent_type = intent_info.get("intent", "SHIFT_START")
+
+            # Normalize spoken identifier if user provided employee ID like 'K6 K 006' or 'A6 ke 006'
+            norm_q = Assistant.normalize_spoken_identifier(clean_q)
+
+            # Extract or clean the name
+            name_cand = identity.extract_name_candidate(norm_q) or query_router.extract_operator_name(norm_q)
+            if not name_cand:
+                name_cand = self._clean_spoken_name(norm_q)
+            name_cand = name_cand.strip() if name_cand else ""
+
+            if not name_cand:
+                self._session_ctx.update(session_id, line_id, awaiting_shift_name=intent_info)
+                return "Please enter or provide your name, employee ID, or employee code so I can proceed."
+
+            # Check if this operator is registered
+            op = shift_store.get_operator(name_cand) or shift_store.find_operator_by_name(name_cand, active_only=False)
+            if not op:
+                matches = shift_store.find_operators_matching_name(name_cand, active_only=False)
+                if len(matches) == 1:
+                    op = matches[0]
+                elif len(matches) > 1:
+                    match_names = [m["name"] for m in matches]
+                    return f"I found multiple operators matching that name. Did you mean {' or '.join(match_names)}?"
+
+            if intent_type == "SHIFT_START":
+                if not op:
+                    # User is not found! Ask for Employee_id
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": name_cand.title(), "intent": "SHIFT_START", "line_id": line_id},
+                    )
+                    return f"I couldn't find {name_cand.title()} in our employee list. Please enter or provide your Employee_id."
+
+                # Operator exists! Ask confirmation to start shift
+                op_id = op["operator_id"]
+                op_name = op.get("name") or name_cand.title()
+                params = {"operator_id": op_id, "operator_name": op_name, "line_id": line_id, "shift_type": "Morning"}
+                prompt = self._prepare_confirmation_prompt("SHIFT_START", params)
+                self._actions.set(session_id, line_id, "SHIFT_START", params, prompt)
+                return prompt
+
+            else:  # SHIFT_END
+                if not op:
+                    return f"I could not find an operator named {name_cand.title()} to end their shift."
+                op_id = op["operator_id"]
+                op_name = op.get("name") or name_cand.title()
+                params = {"operator_id": op_id, "operator_name": op_name, "line_id": line_id}
+                prompt = self._prepare_confirmation_prompt("SHIFT_END", params)
+                self._actions.set(session_id, line_id, "SHIFT_END", params, prompt)
+                return prompt
+
+        # 1.46 Check awaiting_employee_id
+        if sess.awaiting_employee_id:
+            clean_q = query_router.strip_wake_words(question).strip()
+            q_lower = clean_q.lower()
+            words = set(re.findall(r"\b\w+\b", q_lower))
+            cancel_terms = {"cancel", "stop", "roko"}
+            if (words & cancel_terms) or "mat karo" in q_lower:
+                self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+                return "Registration cancelled. No changes were made."
+
+            # If user explicitly issued a fresh shift command (e.g. "start my shift" or "end my shift"),
+            # clear the stale awaiting state and handle the new command freshly
+            prompt_for_name = self._detect_shift_request_lacking_name(clean_q, operator_id=operator_id)
+            if prompt_for_name:
+                intent_type = "SHIFT_END" if "end" in prompt_for_name.lower() else "SHIFT_START"
+                self._session_ctx.update(
+                    session_id,
+                    line_id,
+                    awaiting_employee_id=None,
+                    awaiting_shift_name={"intent": intent_type, "line_id": line_id},
+                )
+                return prompt_for_name
+
+            emp_info = sess.awaiting_employee_id
+            if emp_info.get("intent") == "UPDATE_CODE_NEED_TARGET":
+                op_target = shift_store.get_operator(clean_q) or shift_store.find_operator_by_name(clean_q, active_only=False)
+                if not op_target:
+                    cands = shift_store.find_operators_matching_name(clean_q, active_only=False)
+                    if len(cands) == 1:
+                        op_target = cands[0]
+                    elif len(cands) > 1:
+                        c_names = [c["name"] for c in cands]
+                        return f"I found multiple operators matching that identifier. Did you mean {' or '.join(c_names)}?"
+                if not op_target:
+                    return f"I could not find an operator matching '{clean_q}'. Please enter your name, employee ID, or employee code."
+                target_op_name = op_target["name"]
+                pending_new_code = emp_info.get("new_code")
+                if pending_new_code:
+                    if not re.fullmatch(r"\d+", pending_new_code):
+                        self._session_ctx.update(
+                            session_id,
+                            line_id,
+                            awaiting_employee_id={"operator_name": target_op_name, "intent": "UPDATE_CODE", "line_id": line_id},
+                        )
+                        return "Employee code must contain only numbers. Please enter the code correctly."
+                    self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+                    res_upd = shift_store.update_employee_code(target_op_name, pending_new_code)
+                    if res_upd.get("success"):
+                        return f"Successfully updated employee code for {res_upd.get('operator_name', target_op_name)} to {pending_new_code}."
+                    else:
+                        return res_upd.get("error", "Could not update employee code.")
+                else:
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": target_op_name, "intent": "UPDATE_CODE", "line_id": line_id},
+                    )
+                    return f"Please enter or provide your new numeric employee code for {target_op_name}."
+
+            if emp_info.get("intent") == "UPDATE_CODE":
+                target_op_name = emp_info["operator_name"]
+                m_digits = re.search(r"\b(\d+)\b", clean_q)
+                if not m_digits or not re.fullmatch(r"\d+", clean_q):
+                    return "Employee code must contain only numbers. Please enter the code correctly."
+                new_code_val = m_digits.group(1).strip()
+                self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+                res_upd = shift_store.update_employee_code(target_op_name, new_code_val)
+                if res_upd.get("success"):
+                    return f"Successfully updated employee code for {res_upd.get('operator_name', target_op_name)} to {new_code_val}."
+                else:
+                    return res_upd.get("error", "Could not update employee code.")
+
+            if emp_info.get("intent") == "UPDATE_ID_NEED_TARGET":
+                op_target = shift_store.get_operator(clean_q) or shift_store.find_operator_by_name(clean_q, active_only=False)
+                if not op_target:
+                    cands = shift_store.find_operators_matching_name(clean_q, active_only=False)
+                    if len(cands) == 1:
+                        op_target = cands[0]
+                    elif len(cands) > 1:
+                        c_names = [c["name"] for c in cands]
+                        return f"I found multiple operators matching that identifier. Did you mean {' or '.join(c_names)}?"
+                if not op_target:
+                    return f"I could not find an operator matching '{clean_q}'. Please enter your name, employee ID, or employee code."
+                target_op_name = op_target["name"]
+                pending_new_id = emp_info.get("new_id")
+                if pending_new_id:
+                    clean_pending_eid = pending_new_id.strip().upper()
+                    if not re.fullmatch(r"K6K\d+", clean_pending_eid):
+                        self._session_ctx.update(
+                            session_id,
+                            line_id,
+                            awaiting_employee_id={"operator_name": target_op_name, "intent": "UPDATE_ID", "line_id": line_id},
+                        )
+                        return "Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format."
+                    self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+                    res_upd = shift_store.update_employee_id(target_op_name, clean_pending_eid)
+                    if res_upd.get("success"):
+                        return f"Successfully updated Employee_id for {res_upd.get('operator_name', target_op_name)} to {clean_pending_eid}. Their previous employee code has been cleared."
+                    else:
+                        return res_upd.get("error", "Could not update Employee_id.")
+                else:
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": target_op_name, "intent": "UPDATE_ID", "line_id": line_id},
+                    )
+                    return f"Please enter or provide your new Employee_id for {target_op_name}."
+
+            op_name = emp_info["operator_name"]
+
+            # Did the user say they don't have an Employee_id?
+            if self._is_no_employee_id(clean_q):
+                self._session_ctx.update(
+                    session_id,
+                    line_id,
+                    awaiting_employee_id=None,
+                    awaiting_mobile_digits={"operator_name": op_name, "intent": emp_info.get("intent", "SHIFT_START"), "line_id": line_id},
+                )
+                return "Please provide the last 4 digits of your mobile number to use as your employee code."
+
+            provided_id = self._extract_employee_id_candidate(clean_q)
+            if not provided_id:
+                return f"Please provide your Employee_id for {op_name}, or say you don't have one."
+
+            clean_eid_fmt = provided_id.strip().upper()
+            if not re.fullmatch(r"K6K\d+", clean_eid_fmt):
+                return "Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format."
+
+            if emp_info.get("intent") == "UPDATE_ID":
+                self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+                res_upd = shift_store.update_employee_id(op_name, clean_eid_fmt)
+                if res_upd.get("success"):
+                    return f"Successfully updated Employee_id for {res_upd.get('operator_name', op_name)} to {clean_eid_fmt}. Their previous employee code has been cleared."
+                else:
+                    return res_upd.get("error", "Could not update Employee_id.")
+
+            # Register operator with provided Employee_id
+            self._session_ctx.update(session_id, line_id, awaiting_employee_id=None)
+            new_serial_id = shift_store.get_next_operator_id()
+            shift_store.create_operator(
+                operator_id=new_serial_id,
+                name=op_name,
+                Employee_id=clean_eid_fmt,
+                employee_code=None,
+                role="Operator",
+                active=1,
+            )
+            # Immediately start their shift
+            start_res = shift_store.start_shift(
+                operator_id=new_serial_id,
+                shift_type="Morning",
+                line_id=line_id,
+            )
+            now_spoken = _spoken_time(datetime.datetime.now())
+            return f"{op_name}, your Employee_id {clean_eid_fmt} has been registered and your Morning shift has started at {now_spoken}."
+
+        # 1.47 Check awaiting_mobile_digits
+        if sess.awaiting_mobile_digits:
+            clean_q = query_router.strip_wake_words(question).strip()
+            q_lower = clean_q.lower()
+            words = set(re.findall(r"\b\w+\b", q_lower))
+            cancel_terms = {"cancel", "stop", "roko"}
+            if (words & cancel_terms) or "mat karo" in q_lower:
+                self._session_ctx.update(session_id, line_id, awaiting_mobile_digits=None)
+                return "Registration cancelled. No changes were made."
+
+            prompt_for_name = self._detect_shift_request_lacking_name(clean_q, operator_id=operator_id)
+            if prompt_for_name:
+                intent_type = "SHIFT_END" if "end" in prompt_for_name.lower() else "SHIFT_START"
+                self._session_ctx.update(
+                    session_id,
+                    line_id,
+                    awaiting_mobile_digits=None,
+                    awaiting_shift_name={"intent": intent_type, "line_id": line_id},
+                )
+                return prompt_for_name
+
+            mob_info = sess.awaiting_mobile_digits
+            op_name = mob_info["operator_name"]
+
+            # Check if input is all digits or contains 4 digits
+            m_digits = re.search(r"\b(\d{4})\b", clean_q)
+            if not m_digits:
+                if any(c.isalpha() for c in clean_q):
+                    return "Employee code must contain only numbers. Please enter the code correctly."
+                return "Please provide the last 4 digits of your mobile number as your employee code."
+
+            digits = m_digits.group(1)
+            self._session_ctx.update(session_id, line_id, awaiting_mobile_digits=None)
+            new_serial_id = shift_store.get_next_operator_id()
+            shift_store.create_operator(
+                operator_id=new_serial_id,
+                name=op_name,
+                Employee_id=None,
+                employee_code=digits,
+                role="Operator",
+                active=1,
+            )
+            start_res = shift_store.start_shift(
+                operator_id=new_serial_id,
+                shift_type="Morning",
+                line_id=line_id,
+            )
+            now_spoken = _spoken_time(datetime.datetime.now())
+            return f"{op_name}, your employee code has been registered as {digits} and your Morning shift has started at {now_spoken}."
+
+        # 1.48 Check update Employee_id query: "update employee id for X to Y" / "update my employee id to Y"
+        m_upd = re.search(r"\b(?:update|change|replace|set)\b.*\b(?:employee\s*id|emp\s*id|employee\s*code|emp\s*code|details)\b", question.lower())
+        if m_upd:
+            clean_text = question.strip()
+            clean_lower = clean_text.lower()
+            
+            # Distinguish whether the user wants to update their employee code (to a numeric code)
+            # or update their employee code to an Employee ID (e.g. "update employee code to employee id")
+            is_code_to_id = bool(re.search(r"\b(?:employee\s*code|emp\s*code)\s*(?:to|with|into)\s*(?:employee\s*id|emp\s*id|id)\b", clean_lower))
+            is_code_update = bool(re.search(r"\b(?:employee\s*code|emp\s*code)\b", clean_lower)) and not is_code_to_id
+
+            # Helper to find target operator from query
+            target_op = operator_id
+            if not target_op:
+                ops_list = shift_store.list_operators(active_only=False)
+                for o in ops_list:
+                    oname = (o.get("name") or "").lower()
+                    fname = oname.split()[0] if oname else ""
+                    eid = (o.get("Employee_id") or "").lower()
+                    code = (o.get("employee_code") or "").lower()
+                    op_id = str(o.get("operator_id") or "").lower()
+                    if oname and re.search(r"\b" + re.escape(oname) + r"\b", clean_lower):
+                        target_op = o["name"]
+                        break
+                    if fname and len(fname) >= 3 and re.search(r"\b" + re.escape(fname) + r"\b", clean_lower):
+                        target_op = o["name"]
+                        break
+                    if eid and re.search(r"\b" + re.escape(eid) + r"\b", clean_lower):
+                        target_op = o["name"]
+                        break
+                    if code and re.search(r"\b" + re.escape(code) + r"\b", clean_lower):
+                        target_op = o["name"]
+                        break
+                    if op_id and re.search(r"\b" + re.escape(op_id) + r"\b", clean_lower):
+                        target_op = o["name"]
+                        break
+
+            if not target_op:
+                cand_name = identity.extract_name_candidate(clean_text)
+                if cand_name:
+                    target_op = cand_name
+
+            stopwords = {"for", "employee", "emp", "id", "code", "details", "my", "the", "a", "an", "is", "to", "with", "as", "new"}
+
+            if is_code_update:
+                # User wants to update employee code for a user
+                m_num = re.search(r"\b(?:employee\s*code|emp\s*code)\b.*\b(\d+)\b", clean_text, re.IGNORECASE)
+                code_val = m_num.group(1).strip() if m_num else None
+                if not code_val:
+                    matches_to = re.findall(r"(?:to|with|as|is|:)\s+([A-Za-z0-9_-]+)", clean_text, re.IGNORECASE)
+                    valid = [m.strip() for m in matches_to if m.strip().lower() not in stopwords and (not target_op or m.strip().lower() != target_op.lower())]
+                    code_val = valid[-1] if valid else None
+
+                if not target_op:
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"intent": "UPDATE_CODE_NEED_TARGET", "line_id": line_id, "new_code": code_val},
+                    )
+                    return "Please enter or provide your name, employee ID, or employee code to update your employee code."
+
+                if target_op and not code_val:
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": target_op, "intent": "UPDATE_CODE", "line_id": line_id},
+                    )
+                    return f"Please enter or provide your new numeric employee code for {target_op}."
+
+                if target_op and code_val:
+                    if not re.fullmatch(r"\d+", code_val):
+                        self._session_ctx.update(
+                            session_id,
+                            line_id,
+                            awaiting_employee_id={"operator_name": target_op, "intent": "UPDATE_CODE", "line_id": line_id},
+                        )
+                        return "Employee code must contain only numbers. Please enter the code correctly."
+                    res_upd = shift_store.update_employee_code(target_op, code_val)
+                    if res_upd.get("success"):
+                        return f"Successfully updated employee code for {res_upd.get('operator_name')} to {code_val}."
+                    else:
+                        return res_upd.get("error", "Could not update employee code.")
+
+            # Otherwise, updating Employee ID (or updating employee code to employee id)
+            target_id_val = None
+            m_after_id = re.search(r"\b(?:employee\s*id|emp\s*id|id)\s+(?:to|with|as|is|:)?\s*([A-Za-z0-9_-]+)", clean_text, re.IGNORECASE)
+            if m_after_id:
+                val = m_after_id.group(1).strip()
+                if val.lower() not in stopwords and (not target_op or val.lower() != target_op.lower()):
+                    target_id_val = val
+            if not target_id_val:
+                matches_to = re.findall(r"(?:to|with|as|is|:)\s+([A-Za-z0-9_-]+)", clean_text, re.IGNORECASE)
+                valid = [m.strip() for m in matches_to if m.strip().lower() not in stopwords and (not target_op or m.strip().lower() != target_op.lower())]
+                if valid:
+                    target_id_val = valid[-1]
+
+            if not target_op:
+                self._session_ctx.update(
+                    session_id,
+                    line_id,
+                    awaiting_employee_id={"intent": "UPDATE_ID_NEED_TARGET", "line_id": line_id, "new_id": target_id_val},
+                )
+                return "Please enter or provide your name, employee ID, or employee code to update your details."
+
+            if target_op and not target_id_val:
+                self._session_ctx.update(
+                    session_id,
+                    line_id,
+                    awaiting_employee_id={"operator_name": target_op, "intent": "UPDATE_ID", "line_id": line_id},
+                )
+                return f"Please enter or provide your new Employee_id for {target_op}."
+
+            if target_op and target_id_val:
+                clean_target_eid = target_id_val.strip().upper()
+                if not re.fullmatch(r"K6K\d+", clean_target_eid):
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": target_op, "intent": "UPDATE_ID", "line_id": line_id},
+                    )
+                    return "Employee ID must be in the format of K6K followed by numbers (e.g. K6K001). Please enter it in this format."
+                res_upd = shift_store.update_employee_id(target_op, clean_target_eid)
+                if res_upd.get("success"):
+                    return f"Successfully updated Employee_id for {res_upd.get('operator_name')} to {clean_target_eid}. Their previous employee code has been cleared."
+                else:
+                    return res_upd.get("error", "Could not update Employee_id.")
+
         # 1.5 Check for explicit issue ID alone (without resolution or action language)
         explicit_id = query_router.extract_issue_id(question)
         action_taken, rag_rec = query_router.extract_operator_action(question)
@@ -2352,11 +2919,21 @@ class Assistant:
 
             # For actions inherently tied to the active shift on the line (issue logging, shift ending, handover),
             # if no operator was explicitly specified, use the operator of the active shift on this line.
+            # However, for SHIFT_END, if the user explicitly says "end my shift" without specifying their name,
+            # we do NOT blindly default to whoever is in the database.
+            user_said_my_end_shift = bool(
+                re.search(r"\b(my\s+shift|mera\s+shift|meri\s+shift)\b", question.lower())
+                and not spoken_name
+                and not operator_id
+            )
+
             if not op and classified_intent in (
                 query_router.Intent.LOG_SHIFT_ISSUE,
                 query_router.Intent.SHIFT_END,
                 query_router.Intent.LOG_SHIFT_HANDOVER,
             ):
+                if classified_intent == query_router.Intent.SHIFT_END and user_said_my_end_shift:
+                    return "Please tell me your name so I can end your shift."
                 active_s = shift_store.get_active_shift_for_line(line_id)
                 if active_s and active_s.get("operator_id"):
                     op = shift_store.get_operator(active_s["operator_id"])
@@ -2403,13 +2980,12 @@ class Assistant:
                             "No shift was started. Please check the name or register "
                             "the operator first."
                         )
-                    params = dict(routed.facts)
-                    params["create_operator"] = True
-                    params["operator_name"] = spoken_name.title()
-                    params["line_id"] = line_id
-                    prompt = self._prepare_confirmation_prompt(classified_intent.value, params)
-                    self._actions.set(session_id, line_id, classified_intent.value, params, prompt)
-                    return prompt
+                    self._session_ctx.update(
+                        session_id,
+                        line_id,
+                        awaiting_employee_id={"operator_name": spoken_name.title(), "intent": "SHIFT_START", "line_id": line_id},
+                    )
+                    return f"I couldn't find {spoken_name.title()} in our employee list. Please enter or provide your Employee_id."
 
                 if spoken_name:
                     return (
@@ -2417,6 +2993,10 @@ class Assistant:
                         "No shift was started. Please check the name or register "
                         "the operator first."
                     )
+
+                if classified_intent == query_router.Intent.SHIFT_START and re.search(r"\b(my\s+shift|mera\s+shift|meri\s+shift)\b", question.lower()):
+                    return "Please tell me your name so I can start your shift."
+
                 return "No active operator is registered on this line. Please select your operator profile on the terminal."
 
             params = dict(routed.facts)
@@ -2523,10 +3103,20 @@ class Assistant:
             or sess.awaiting_outcome
             or sess.awaiting_problem_details
             or sess.awaiting_action_for_issue
+            or sess.awaiting_shift_name
+            or sess.awaiting_employee_id
+            or sess.awaiting_mobile_digits
         )
 
         if pending or has_awaiting_state:
             yield self.ask(question, session_id=session_id, line_id=line_id, operator_id=operator_id, routed=routed)
+            return
+
+        prompt_for_name = self._detect_shift_request_lacking_name(question, operator_id=operator_id)
+        if prompt_for_name:
+            intent_type = "SHIFT_END" if "end" in prompt_for_name.lower() else "SHIFT_START"
+            self._session_ctx.update(session_id, line_id, awaiting_shift_name={"intent": intent_type, "line_id": line_id})
+            yield prompt_for_name
             return
 
         casual = self._is_casual_or_greeting(question)

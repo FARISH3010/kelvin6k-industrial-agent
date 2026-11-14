@@ -506,7 +506,14 @@ body {
   opacity: 1;
 }
 
-/* --- temporary microphone debug readout --- */
+/* Full page Attendance Report Dashboard View */
+.report-dashboard-container {
+  width: 100%;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding-bottom: 24px;
+}
+
 .mic-debug {
   margin: 8px 0 0;
   padding: 8px 10px;

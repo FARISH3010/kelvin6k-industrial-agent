@@ -270,8 +270,9 @@ export interface MetrologyAnnouncementResponse {
 // --- Attendance & Operators ---
 
 export interface Operator {
-  operator_id: string;
+  operator_id: string | number;
   eid?: string;
+  Employee_id?: string;
   name: string;
   employee_code?: string;
   role: string;
@@ -282,8 +283,9 @@ export interface Operator {
 
 export interface AttendanceRecord {
   id: number;
-  operator_id?: string;
+  operator_id?: string | number;
   eid?: string;
+  Employee_id?: string;
   employee_name: string;
   attendance_date: string;
   shift_start: number;
@@ -333,3 +335,31 @@ export interface WallProductionTotal {
   by_operator: WallProductionOperatorSummary[];
   records?: WallProductionRecord[];
 }
+
+// --- Attendance Report Dashboard ---
+
+export interface AttendanceReportItem {
+  shift_id: number | string;
+  operator_id: string | number;
+  id: string; // Employee ID or "-"
+  code: string; // Employee code or "-"
+  name: string;
+  start_time: string; // e.g. "08:30 AM"
+  end_time: string; // e.g. "05:30 PM" or "-"
+  overtime: string; // e.g. "1.50 hrs" or "0.00 hrs"
+  overtime_num: number;
+  date: string; // YYYY-MM-DD
+  total_hours: string; // e.g. "9.00 hrs"
+  total_hours_num: number;
+  presence: "Present" | "Absent";
+  status: "ACTIVE" | "COMPLETED" | "ABSENT";
+  attendance_status: string;
+}
+
+export interface AttendanceReportResponse {
+  report: AttendanceReportItem[];
+  count: number;
+  total_work_hours: number;
+  total_overtime_hours: number;
+}
+
